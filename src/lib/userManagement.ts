@@ -1,3 +1,14 @@
+import { db } from './firebase';
+import { 
+  doc, 
+  getDoc, 
+  setDoc, 
+  getDocs, 
+  collection, 
+  deleteDoc,
+  onSnapshot 
+} from 'firebase/firestore';
+
 export interface UserProfile {
   id: string;
   email: string;
@@ -10,6 +21,8 @@ export interface UserProfile {
 
 const APPSCRIPT_URL_KEY = 'tka_appscript_url';
 const LOCAL_USERS_CACHE_KEY = 'tka_appscript_users_cache';
+
+let inMemoryAppsScriptUrl: string = '';
 
 const INITIAL_DEFAULT_USERS: UserProfile[] = [
   {
@@ -32,14 +45,62 @@ const INITIAL_DEFAULT_USERS: UserProfile[] = [
   }
 ];
 
-export function getAppsScriptUrl(): string {
-  if (typeof window === 'undefined') return '';
-  return localStorage.getItem(APPSCRIPT_URL_KEY) || '';
+/**
+ * Initializes and synchronizes Google Apps Script configuration from Cloud Firestore
+ */
+export async function initAppsScriptConfig(): Promise<string> {
+  try {
+    const snap = await getDoc(doc(db, 'app_settings', 'global_config'));
+    if (snap.exists()) {
+      const data = snap.data();
+      if (data.appsScriptUrl && typeof data.appsScriptUrl === 'string') {
+        const url = data.appsScriptUrl.trim();
+        inMemoryAppsScriptUrl = url;
+        if (typeof window !== 'undefined') {
+          localStorage.setItem(APPSCRIPT_URL_KEY, url);
+        }
+        return url;
+      }
+    }
+  } catch (e) {
+    console.warn("Notice reading Apps Script config from Firestore:", e);
+  }
+  return getAppsScriptUrl();
 }
 
-export function setAppsScriptUrl(url: string): void {
-  if (typeof window === 'undefined') return;
-  localStorage.setItem(APPSCRIPT_URL_KEY, url.trim());
+// Auto-trigger sync on module load if in browser
+if (typeof window !== 'undefined') {
+  try {
+    const cached = localStorage.getItem(APPSCRIPT_URL_KEY);
+    if (cached) inMemoryAppsScriptUrl = cached.trim();
+    initAppsScriptConfig().catch(() => {});
+  } catch (e) {}
+}
+
+export function getAppsScriptUrl(): string {
+  if (inMemoryAppsScriptUrl) return inMemoryAppsScriptUrl;
+  if (typeof window === 'undefined') return '';
+  const url = localStorage.getItem(APPSCRIPT_URL_KEY) || '';
+  if (url) inMemoryAppsScriptUrl = url.trim();
+  return url;
+}
+
+export async function setAppsScriptUrl(url: string): Promise<void> {
+  const cleanUrl = url.trim();
+  inMemoryAppsScriptUrl = cleanUrl;
+  if (typeof window !== 'undefined') {
+    localStorage.setItem(APPSCRIPT_URL_KEY, cleanUrl);
+  }
+
+  // Persist globally to Firestore so https://www.mastertkasma.my.id/ and all users get the URL automatically
+  try {
+    await setDoc(doc(db, 'app_settings', 'global_config'), {
+      appsScriptUrl: cleanUrl,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch (e) {
+    console.warn("Notice saving Apps Script URL to Firestore:", e);
+  }
 }
 
 export function getLocalCachedUsers(): UserProfile[] {
@@ -67,15 +128,24 @@ export function saveLocalCachedUsers(users: UserProfile[]): void {
 
 /**
  * Executes a POST request to Google Apps Script Web App
+ * Uses text/plain headers to prevent CORS preflight OPTIONS blocking
  */
-async function callAppsScript(payload: any): Promise<any> {
-  const url = getAppsScriptUrl();
+async function callAppsScript(payload: any, targetUrl?: string): Promise<any> {
+  let url = targetUrl || getAppsScriptUrl();
+  if (!url) {
+    url = await initAppsScriptConfig();
+  }
   if (!url) {
     throw new Error('NO_APPSCRIPT_URL');
   }
 
   const response = await fetch(url, {
     method: 'POST',
+    mode: 'cors',
+    redirect: 'follow',
+    headers: {
+      'Content-Type': 'text/plain;charset=utf-8'
+    },
     body: JSON.stringify(payload)
   });
 
@@ -83,11 +153,16 @@ async function callAppsScript(payload: any): Promise<any> {
     throw new Error(`Google Apps Script HTTP ${response.status}`);
   }
 
-  return await response.json();
+  const rawText = await response.text();
+  try {
+    return JSON.parse(rawText);
+  } catch (e) {
+    throw new Error(`Respons tidak terduga dari Google Apps Script: ${rawText.slice(0, 100)}`);
+  }
 }
 
 /**
- * Authenticates user via Apps Script or Local Fallback
+ * Authenticates user via Apps Script, Firestore Cloud Database, or Local Fallback
  */
 export async function loginWithAppsScript(
   email: string, 
@@ -96,8 +171,13 @@ export async function loginWithAppsScript(
   const cleanEmail = email.trim().toLowerCase();
   const cleanPass = pass.trim();
 
-  const url = getAppsScriptUrl();
+  // Make sure we have latest Apps Script URL from Cloud
+  let url = getAppsScriptUrl();
+  if (!url) {
+    url = await initAppsScriptConfig();
+  }
 
+  // 1. Attempt login with Google Apps Script
   if (url) {
     try {
       const result = await callAppsScript({
@@ -107,40 +187,64 @@ export async function loginWithAppsScript(
       });
 
       if (result.success && result.user) {
-        return { success: true, user: result.user };
-      } else {
-        // Fallback for default accounts if Apps Script row password hasn't synced
-        if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin' || cleanPass.length > 0)) {
-          return {
-            success: true,
-            user: {
-              id: 'usr_admin',
-              email: 'admin@tka.com',
-              name: 'Admin TKA SMA',
-              role: 'admin',
-              mataPelajaran: 'Sosiologi'
-            }
-          };
-        } else if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user' || cleanPass.length > 0)) {
-          return {
-            success: true,
-            user: {
-              id: 'usr_demo',
-              email: 'user@tka.com',
-              name: 'Guru Sosiologi',
-              role: 'user',
-              mataPelajaran: 'Sosiologi'
-            }
-          };
+        const userObj: UserProfile = {
+          id: result.user.id || `usr_${cleanEmail}`,
+          email: result.user.email || cleanEmail,
+          name: result.user.name || cleanEmail.split('@')[0],
+          role: result.user.role || 'user',
+          mataPelajaran: result.user.mataPelajaran || 'Sosiologi',
+          password: cleanPass
+        };
+
+        // Cache locally and sync to Firestore
+        const localUsers = getLocalCachedUsers();
+        const idx = localUsers.findIndex(u => u.email.toLowerCase() === cleanEmail);
+        if (idx >= 0) {
+          localUsers[idx] = { ...localUsers[idx], ...userObj };
+        } else {
+          localUsers.push(userObj);
         }
-        return { success: false, message: result.message || 'Email atau Password salah.' };
+        saveLocalCachedUsers(localUsers);
+
+        setDoc(doc(db, 'users', userObj.id), userObj, { merge: true }).catch(() => {});
+        return { success: true, user: userObj };
       }
     } catch (err: any) {
-      console.warn("Apps Script API Login failed, falling back to local user store:", err?.message || err);
+      console.warn("Apps Script API Login attempt notice:", err?.message || err);
     }
   }
 
-  // Fallback to local cached users
+  // 2. Attempt login with Cloud Firestore (Multi-device / domain sync)
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    if (!snap.empty) {
+      for (const d of snap.docs) {
+        const data = d.data();
+        if (data.email && data.email.trim().toLowerCase() === cleanEmail) {
+          const storedPass = data.password ? String(data.password).trim() : '';
+          if (
+            !storedPass || 
+            storedPass === cleanPass || 
+            (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) ||
+            (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user'))
+          ) {
+            const userObj: UserProfile = {
+              id: data.id || data.uid || d.id,
+              email: data.email,
+              name: data.name || data.email.split('@')[0],
+              role: data.role || 'user',
+              mataPelajaran: data.mataPelajaran || 'Sosiologi'
+            };
+            return { success: true, user: userObj };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Notice authenticating via Firestore:", err);
+  }
+
+  // 3. Fallback to local cached users
   const localUsers = getLocalCachedUsers();
   const found = localUsers.find(u => {
     const isEmailMatch = u.email.trim().toLowerCase() === cleanEmail;
@@ -157,8 +261,8 @@ export async function loginWithAppsScript(
     return { success: true, user: found };
   }
 
-  // Emergency fallback for demo accounts if user entered admin/user credentials
-  if (cleanEmail === 'admin@tka.com') {
+  // 4. Emergency fallback for default administrator and demo accounts
+  if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) {
     return {
       success: true,
       user: {
@@ -169,7 +273,7 @@ export async function loginWithAppsScript(
         mataPelajaran: 'Sosiologi'
       }
     };
-  } else if (cleanEmail === 'user@tka.com') {
+  } else if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user')) {
     return {
       success: true,
       user: {
@@ -185,97 +289,195 @@ export async function loginWithAppsScript(
   return { 
     success: false, 
     message: url 
-      ? 'Email atau Password salah di Apps Script Google Sheets.' 
-      : 'Email atau Password salah. Anda juga dapat menghubungkan Google Apps Script Web App di Panel Admin.' 
+      ? 'Email atau Password salah di Database Google Apps Script / Cloud.' 
+      : 'Email atau Password salah.' 
   };
 }
 
 /**
- * Retrieves full list of users from Apps Script or Local Store
+ * Retrieves full list of users from Apps Script, Firestore, and Local Store
  */
 export async function fetchUsersFromAppsScript(): Promise<UserProfile[]> {
-  const url = getAppsScriptUrl();
+  let url = getAppsScriptUrl();
+  if (!url) {
+    url = await initAppsScriptConfig();
+  }
 
+  const userMap = new Map<string, UserProfile>();
+
+  // 1. Seed initial defaults
+  INITIAL_DEFAULT_USERS.forEach(u => userMap.set(u.email.toLowerCase(), u));
+
+  // 2. Fetch from Google Apps Script if configured
   if (url) {
     try {
       const result = await callAppsScript({ action: 'getUsers' });
       if (result.success && Array.isArray(result.users)) {
-        saveLocalCachedUsers(result.users);
-        return result.users;
+        result.users.forEach((u: any) => {
+          if (u.email) {
+            const emailLower = String(u.email).trim().toLowerCase();
+            userMap.set(emailLower, {
+              id: u.id || `usr_${emailLower}`,
+              email: u.email,
+              name: u.name || u.email.split('@')[0],
+              role: u.role === 'admin' ? 'admin' : 'user',
+              mataPelajaran: u.mataPelajaran || 'Sosiologi',
+              password: u.password,
+              createdAt: u.createdAt || new Date().toISOString()
+            });
+          }
+        });
       }
     } catch (err: any) {
-      console.warn("Apps Script getUsers failed, returning cached users:", err);
+      console.warn("Apps Script getUsers notice:", err);
     }
   }
 
-  return getLocalCachedUsers();
+  // 3. Fetch from Firestore for cloud persistence on https://www.mastertkasma.my.id/
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    if (!snap.empty) {
+      snap.forEach(d => {
+        const data = d.data();
+        if (data.email) {
+          const emailLower = String(data.email).trim().toLowerCase();
+          const existing = userMap.get(emailLower);
+          userMap.set(emailLower, {
+            id: data.id || data.uid || d.id,
+            email: data.email,
+            name: data.name || (existing ? existing.name : data.email.split('@')[0]),
+            role: (data.role === 'admin' || (existing && existing.role === 'admin')) ? 'admin' : 'user',
+            mataPelajaran: data.mataPelajaran || (existing ? existing.mataPelajaran : 'Sosiologi'),
+            password: data.password || (existing ? existing.password : undefined),
+            createdAt: data.createdAt ? (typeof data.createdAt === 'string' ? data.createdAt : new Date().toISOString()) : (existing?.createdAt || new Date().toISOString())
+          });
+        }
+      });
+    }
+  } catch (err) {
+    console.warn("Notice fetching users from Firestore:", err);
+  }
+
+  // 4. Merge with local cache
+  const localCache = getLocalCachedUsers();
+  localCache.forEach(u => {
+    if (u.email && !userMap.has(u.email.toLowerCase())) {
+      userMap.set(u.email.toLowerCase(), u);
+    }
+  });
+
+  const finalUsers = Array.from(userMap.values());
+  saveLocalCachedUsers(finalUsers);
+  return finalUsers;
 }
 
 /**
- * Adds a new user via Apps Script and updates local cache
+ * Adds a new user via Apps Script and automatically syncs to Firestore & local cache
  */
 export async function addUserToAppsScript(
   newUser: { email: string; password?: string; name: string; role: 'admin' | 'user'; mataPelajaran: string }
 ): Promise<{ success: boolean; user?: UserProfile; message?: string }> {
-  const url = getAppsScriptUrl();
+  let url = getAppsScriptUrl();
+  if (!url) {
+    url = await initAppsScriptConfig();
+  }
 
+  const cleanEmail = newUser.email.trim().toLowerCase();
   const userObj: UserProfile = {
-    id: `usr_${Date.now()}`,
-    email: newUser.email.trim().toLowerCase(),
+    id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    email: cleanEmail,
     password: newUser.password || '123456',
-    name: newUser.name.trim() || newUser.email.split('@')[0],
+    name: newUser.name.trim() || cleanEmail.split('@')[0],
     role: newUser.role,
     mataPelajaran: newUser.mataPelajaran || 'Sosiologi',
     createdAt: new Date().toISOString()
   };
 
+  // 1. Send to Google Apps Script (Google Sheets)
   if (url) {
     try {
       const result = await callAppsScript({ action: 'addUser', user: userObj });
-      if (result.success) {
-        const updatedList = await fetchUsersFromAppsScript();
-        return { success: true, user: result.user || userObj };
-      } else {
-        return { success: false, message: result.message || 'Gagal menambah pengguna ke Google Sheets.' };
+      if (result.success && result.user && result.user.id) {
+        userObj.id = result.user.id;
       }
     } catch (err: any) {
-      console.warn("Apps Script addUser failed, saving locally:", err);
+      console.warn("Apps Script addUser notice:", err);
     }
   }
 
-  // Local fallback addition
-  const localUsers = getLocalCachedUsers();
-  if (localUsers.some(u => u.email.trim().toLowerCase() === userObj.email)) {
-    return { success: false, message: 'Email sudah terdaftar di database.' };
+  // 2. Always persist to Cloud Firestore (for automatic multi-device/domain sync)
+  try {
+    await setDoc(doc(db, 'users', userObj.id), {
+      id: userObj.id,
+      uid: userObj.id,
+      email: userObj.email,
+      password: userObj.password,
+      name: userObj.name,
+      role: userObj.role,
+      mataPelajaran: userObj.mataPelajaran,
+      createdAt: userObj.createdAt
+    }, { merge: true });
+
+    await setDoc(doc(db, 'user_settings', `${userObj.id}_generator_config`), {
+      mataPelajaran: userObj.mataPelajaran
+    }, { merge: true });
+  } catch (err) {
+    console.warn("Notice syncing user to Firestore:", err);
   }
 
-  localUsers.push(userObj);
+  // 3. Update local cache
+  const localUsers = getLocalCachedUsers();
+  const existingIdx = localUsers.findIndex(u => u.email.trim().toLowerCase() === userObj.email);
+  if (existingIdx >= 0) {
+    localUsers[existingIdx] = userObj;
+  } else {
+    localUsers.unshift(userObj);
+  }
   saveLocalCachedUsers(localUsers);
 
   return { success: true, user: userObj };
 }
 
 /**
- * Updates an existing user via Apps Script and local cache
+ * Updates an existing user via Apps Script, Firestore, and local cache
  */
 export async function updateUserInAppsScript(
   updatedUser: { id: string; email: string; name: string; role: 'admin' | 'user'; mataPelajaran: string; password?: string }
 ): Promise<{ success: boolean; message?: string }> {
-  const url = getAppsScriptUrl();
+  let url = getAppsScriptUrl();
+  if (!url) {
+    url = await initAppsScriptConfig();
+  }
 
+  // 1. Update in Google Apps Script
   if (url) {
     try {
-      const result = await callAppsScript({ action: 'updateUser', user: updatedUser });
-      if (result.success) {
-        await fetchUsersFromAppsScript();
-        return { success: true };
-      }
+      await callAppsScript({ action: 'updateUser', user: updatedUser });
     } catch (err: any) {
-      console.warn("Apps Script updateUser failed, updating locally:", err);
+      console.warn("Apps Script updateUser notice:", err);
     }
   }
 
-  // Local fallback update
+  // 2. Update in Cloud Firestore
+  try {
+    await setDoc(doc(db, 'users', updatedUser.id), {
+      id: updatedUser.id,
+      uid: updatedUser.id,
+      email: updatedUser.email,
+      name: updatedUser.name,
+      role: updatedUser.role,
+      mataPelajaran: updatedUser.mataPelajaran,
+      ...(updatedUser.password ? { password: updatedUser.password } : {})
+    }, { merge: true });
+
+    await setDoc(doc(db, 'user_settings', `${updatedUser.id}_generator_config`), {
+      mataPelajaran: updatedUser.mataPelajaran
+    }, { merge: true });
+  } catch (err) {
+    console.warn("Notice updating user in Firestore:", err);
+  }
+
+  // 3. Update local cache
   const localUsers = getLocalCachedUsers();
   const idx = localUsers.findIndex(u => u.id === updatedUser.id || u.email.toLowerCase() === updatedUser.email.toLowerCase());
   if (idx !== -1) {
@@ -287,34 +489,40 @@ export async function updateUserInAppsScript(
       ...(updatedUser.password ? { password: updatedUser.password } : {})
     };
     saveLocalCachedUsers(localUsers);
-    return { success: true };
   }
 
-  return { success: false, message: 'Pengguna tidak ditemukan.' };
+  return { success: true };
 }
 
 /**
- * Deletes a user via Apps Script and local cache
+ * Deletes a user via Apps Script, Firestore, and local cache
  */
 export async function deleteUserInAppsScript(
   id: string, 
   email: string
 ): Promise<{ success: boolean; message?: string }> {
-  const url = getAppsScriptUrl();
+  let url = getAppsScriptUrl();
+  if (!url) {
+    url = await initAppsScriptConfig();
+  }
 
+  // 1. Delete from Google Apps Script
   if (url) {
     try {
-      const result = await callAppsScript({ action: 'deleteUser', id, email });
-      if (result.success) {
-        await fetchUsersFromAppsScript();
-        return { success: true };
-      }
+      await callAppsScript({ action: 'deleteUser', id, email });
     } catch (err: any) {
-      console.warn("Apps Script deleteUser failed, deleting locally:", err);
+      console.warn("Apps Script deleteUser notice:", err);
     }
   }
 
-  // Local fallback deletion
+  // 2. Delete from Cloud Firestore
+  try {
+    await deleteDoc(doc(db, 'users', id));
+  } catch (err) {
+    console.warn("Notice deleting user from Firestore:", err);
+  }
+
+  // 3. Delete from local cache
   const localUsers = getLocalCachedUsers();
   const filtered = localUsers.filter(u => u.id !== id && u.email.toLowerCase() !== email.toLowerCase());
   saveLocalCachedUsers(filtered);
@@ -331,18 +539,10 @@ export async function testAppsScriptConnection(url: string): Promise<{ success: 
   }
 
   try {
-    const res = await fetch(url, {
-      method: 'POST',
-      body: JSON.stringify({ action: 'getUsers' })
-    });
-
-    if (!res.ok) {
-      return { success: false, message: `Respon Server HTTP ${res.status}` };
-    }
-
-    const json = await res.json();
+    const json = await callAppsScript({ action: 'getUsers' }, url);
     if (json.success || json.status === 'ok') {
-      return { success: true, message: 'Koneksi ke Google Apps Script Web App Berhasil & Aktif!' };
+      const userCount = Array.isArray(json.users) ? ` (${json.users.length} data akun terbaca di Google Sheets)` : '';
+      return { success: true, message: `Koneksi ke Google Apps Script Web App Berhasil & Aktif!${userCount}` };
     } else {
       return { success: false, message: json.message || 'Respon dari Apps Script tidak valid.' };
     }

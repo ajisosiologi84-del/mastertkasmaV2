@@ -67,6 +67,7 @@ import { auth, db } from './lib/firebase';
 import { 
   getAppsScriptUrl, 
   setAppsScriptUrl, 
+  initAppsScriptConfig,
   testAppsScriptConnection, 
   fetchUsersFromAppsScript, 
   addUserToAppsScript, 
@@ -2425,7 +2426,33 @@ export default function App() {
     }
   }, []);
 
-  // Fetch users list from Apps Script or Local Cache
+  // Synchronize Google Apps Script URL configuration across all devices / domains
+  useEffect(() => {
+    initAppsScriptConfig().then((url) => {
+      if (url) {
+        setAppsScriptUrlInput(url);
+      }
+    });
+
+    const unsub = onSnapshot(doc(db, 'app_settings', 'global_config'), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.appsScriptUrl && typeof data.appsScriptUrl === 'string') {
+          const url = data.appsScriptUrl.trim();
+          setAppsScriptUrlInput(url);
+          if (typeof window !== 'undefined') {
+            localStorage.setItem('tka_appscript_url', url);
+          }
+        }
+      }
+    }, (err) => {
+      console.warn("Notice listening to global apps script config:", err);
+    });
+
+    return () => unsub();
+  }, []);
+
+  // Fetch users list from Apps Script, Cloud Firestore, and Local Cache
   useEffect(() => {
     if (!currentUser) return;
     const loadUsers = async () => {
@@ -12415,12 +12442,12 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                   <button
                     type="button"
                     onClick={async () => {
-                      setAppsScriptUrl(appsScriptUrlInput.trim());
+                      await setAppsScriptUrl(appsScriptUrlInput.trim());
                       setAppsScriptTestMsg({
                         success: true,
                         text: appsScriptUrlInput.trim() 
-                          ? "URL Google Apps Script berhasil disimpan! Memuat data pengguna dari Google Sheets..." 
-                          : "URL Apps Script dikosongkan. Sistem beralih ke mode penyimpanan lokal/cache."
+                          ? "URL Google Apps Script berhasil disimpan ke Cloud & Lokal! Memuat data pengguna..." 
+                          : "URL Apps Script dikosongkan. Sistem beralih ke mode penyimpanan lokal & Cloud Database."
                       });
                       const users = await fetchUsersFromAppsScript();
                       setUsersList(users);
