@@ -57,11 +57,24 @@ import {
   UserCheck,
   FileUp,
   ClipboardPaste,
-  FileCheck
+  FileCheck,
+  Database,
+  FileCode
 } from 'lucide-react';
 import mammoth from 'mammoth';
 import { KisiKisiItem, Question, GeneratorConfig, BentukSoal, LevelKognitif, JumlahOpsi, JenisSoal, JadwalItem } from './types';
-import { auth, db, createNewUserByAdmin } from './lib/firebase';
+import { auth, db } from './lib/firebase';
+import { 
+  getAppsScriptUrl, 
+  setAppsScriptUrl, 
+  testAppsScriptConnection, 
+  fetchUsersFromAppsScript, 
+  addUserToAppsScript, 
+  updateUserInAppsScript, 
+  deleteUserInAppsScript, 
+  DEFAULT_APPSCRIPT_CODE,
+  UserProfile 
+} from './lib/userManagement';
 import { 
   onAuthStateChanged, 
   signOut,
@@ -1683,6 +1696,13 @@ export default function App() {
   const [userError, setUserError] = useState<string | null>(null);
   const [userSuccess, setUserSuccess] = useState<string | null>(null);
 
+  // Apps Script Database Configuration State
+  const [appsScriptUrlInput, setAppsScriptUrlInput] = useState<string>(() => getAppsScriptUrl());
+  const [isTestingAppsScript, setIsTestingAppsScript] = useState<boolean>(false);
+  const [appsScriptTestMsg, setAppsScriptTestMsg] = useState<{ success: boolean; text: string } | null>(null);
+  const [showAppsScriptGuideModal, setShowAppsScriptGuideModal] = useState<boolean>(false);
+  const [isCopyingScriptCode, setIsCopyingScriptCode] = useState<boolean>(false);
+
   const [config, setConfig] = useState<GeneratorConfig>({
     mataPelajaran: 'Sosiologi',
     definisi: 'Asesmen Akhir Semester (AAS) Ganjil',
@@ -2215,7 +2235,7 @@ export default function App() {
 
       // For non-admin teachers, do not auto-seed sample matrix rows so they start in an empty state ("posisi kosong blm ada yang dipilih")
       if (isUserTeacher) {
-        await updateDoc(userDocRef, { isSeeded: true });
+        await setDoc(userDocRef, { isSeeded: true }, { merge: true });
         return;
       }
 
@@ -2223,7 +2243,7 @@ export default function App() {
       
       // If kisi_kisi is already seeded for this user, return
       if (!kisiSnap.empty) {
-        await updateDoc(doc(db, 'users', userId), { isSeeded: true });
+        await setDoc(doc(db, 'users', userId), { isSeeded: true }, { merge: true });
         return;
       }
 
@@ -2383,73 +2403,41 @@ export default function App() {
     }
   };
 
-  // Auth changed hook
+  // User Session Management (Apps Script & Local Storage Session)
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (user) {
-        setCurrentUser(user);
-        try {
-          const userDocRef = doc(db, 'users', user.uid);
-          const userDocSnap = await getDoc(userDocRef);
-          if (userDocSnap.exists()) {
-            const data = userDocSnap.data();
-            setUserRole(data.role || 'user');
-            setUserName(data.name || user.displayName || user.email?.split('@')[0] || 'User');
-            
-            if (data.mataPelajaran) {
-              setConfig(prev => ({ ...prev, mataPelajaran: data.mataPelajaran }));
-            }
-
-            if (data.geminiApiKey) {
-              setAiConfig(prev => ({ ...prev, apiKey: data.geminiApiKey, mode: 'client' }));
-              localStorage.setItem('gemini_api_key', data.geminiApiKey);
-            }
-            
-            if (!data.isSeeded) {
-              await seedDefaultData(user.uid, data.mataPelajaran || 'Sosiologi');
-            }
-          } else {
-            const isAdminEmail = user.email === 'admin@tka.com' || user.email === 'ajisosiologi84@gmail.com';
-            const defaultRole = isAdminEmail ? 'admin' : 'user';
-            const defaultName = user.displayName || (isAdminEmail ? 'Admin TKA SMA' : 'Guru Sosiologi');
-            const defaultSubject = 'Sosiologi';
-            
-            await setDoc(userDocRef, {
-              uid: user.uid,
-              email: user.email,
-              name: defaultName,
-              role: defaultRole,
-              mataPelajaran: defaultSubject,
-              isSeeded: true,
-              createdAt: new Date()
-            });
-            
-            await seedDefaultData(user.uid, defaultSubject);
-            
-            setUserRole(defaultRole);
-            setUserName(defaultName);
+    try {
+      const activeSession = localStorage.getItem('tka_active_session');
+      if (activeSession) {
+        const userObj = JSON.parse(activeSession);
+        if (userObj && userObj.email) {
+          setCurrentUser({ uid: userObj.id || 'usr_demo', email: userObj.email, displayName: userObj.name || userObj.email.split('@')[0] });
+          setUserRole(userObj.role === 'admin' ? 'admin' : 'user');
+          setUserName(userObj.name || userObj.email.split('@')[0]);
+          if (userObj.mataPelajaran) {
+            setConfig(prev => ({ ...prev, mataPelajaran: userObj.mataPelajaran }));
           }
-        } catch (err: any) {
-          const isQuotaErr = (err?.message || String(err)).toLowerCase().includes('quota');
-          if (isQuotaErr) {
-            console.warn("Firestore quota exceeded during auth profile load, using local defaults silently:", err?.message || err);
-          } else {
-            console.warn("Error loading user profile:", err);
-          }
-          const isAdminEmail = user.email === 'admin@tka.com' || user.email === 'ajisosiologi84@gmail.com';
-          setUserRole(isAdminEmail ? 'admin' : 'user');
-          setUserName(user.displayName || (isAdminEmail ? 'Admin TKA SMA' : (user.email?.split('@')[0] || 'Guru Sosiologi')));
         }
-      } else {
-        setCurrentUser(null);
-        setUserRole(null);
-        setUserName('');
       }
+    } catch (e) {
+      console.warn("Notice reading active session:", e);
+    } finally {
       setIsAuthLoading(false);
-    });
-
-    return () => unsubscribe();
+    }
   }, []);
+
+  // Fetch users list from Apps Script or Local Cache
+  useEffect(() => {
+    if (!currentUser) return;
+    const loadUsers = async () => {
+      try {
+        const users = await fetchUsersFromAppsScript();
+        setUsersList(users);
+      } catch (err) {
+        console.warn("Notice loading users list:", err);
+      }
+    };
+    loadUsers();
+  }, [currentUser, userRole]);
 
   // Fast local storage initialization and lightweight User Management listener
   useEffect(() => {
@@ -2650,7 +2638,11 @@ export default function App() {
   const executeSignOut = async () => {
     setShowSignOutConfirm(false);
     try {
-      await signOut(auth);
+      localStorage.removeItem('tka_active_session');
+      setCurrentUser(null);
+      setUserRole(null);
+      setUserName('');
+      await signOut(auth).catch(() => {});
     } catch (err) {
       console.error("Error signing out:", err);
     }
@@ -3172,12 +3164,12 @@ export default function App() {
     }
 
     if (currentUser && config.mataPelajaran) {
-      updateDoc(doc(db, 'users', currentUser.uid), {
+      setDoc(doc(db, 'users', currentUser.uid), {
         mataPelajaran: config.mataPelajaran
-      }).catch(err => console.error("Error saving subject selection:", err));
+      }, { merge: true }).catch(err => console.warn("Notice saving subject selection to users:", err));
       setDoc(doc(db, 'user_settings', `${currentUser.uid}_generator_config`), {
         mataPelajaran: config.mataPelajaran
-      }, { merge: true }).catch(err => console.error("Error saving subject selection to settings:", err));
+      }, { merge: true }).catch(err => console.warn("Notice saving subject selection to settings:", err));
     }
   }, [config.mataPelajaran, currentUser]);
 
@@ -6198,7 +6190,7 @@ PANDUAN EKSTRA:
     setKisiList(prev => prev.map(item => item.id === id ? { ...item, jenisSoal: newJenis } : item));
     if (currentUser?.uid) {
       try {
-        await updateDoc(doc(db, 'kisi_kisi', id), { jenisSoal: newJenis });
+        await setDoc(doc(db, 'kisi_kisi', id), { jenisSoal: newJenis }, { merge: true });
       } catch (err) {
         console.warn("Failed to update jenisSoal in firestore:", err);
       }
@@ -7316,7 +7308,36 @@ PANDUAN EKSTRA:
   }
 
   if (!currentUser) {
-    return <LoginScreen onLoginSuccess={(role, name) => { setUserRole(role); setUserName(name); }} />;
+    return (
+      <LoginScreen 
+        onLoginSuccess={(role, name, userObj) => {
+          const sessionUser = userObj || {
+            id: role === 'admin' ? 'usr_admin' : 'usr_demo',
+            email: role === 'admin' ? 'admin@tka.com' : 'user@tka.com',
+            name: name || (role === 'admin' ? 'Admin TKA SMA' : 'Guru Sosiologi'),
+            role: role,
+            mataPelajaran: 'Sosiologi'
+          };
+
+          try {
+            localStorage.setItem('tka_active_session', JSON.stringify(sessionUser));
+          } catch (e) {
+            console.warn("Gagal menyimpan sesi aktif:", e);
+          }
+
+          setCurrentUser({
+            uid: sessionUser.id || 'usr_demo',
+            email: sessionUser.email,
+            displayName: sessionUser.name || name
+          });
+          setUserRole(role);
+          setUserName(name || sessionUser.name);
+          if (sessionUser.mataPelajaran) {
+            setConfig(prev => ({ ...prev, mataPelajaran: sessionUser.mataPelajaran }));
+          }
+        }} 
+      />
+    );
   }
 
   return (
@@ -12319,364 +12340,565 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
 
         {/* Tab 5: Manajemen Pengguna */}
         {activeTab === 'users' && userRole === 'admin' && (
-          <div id="users-panel" className="grid grid-cols-1 lg:grid-cols-12 gap-8 animate-fadeIn no-print">
-            {/* Left Col: Add User Form */}
-            <section className="lg:col-span-5 bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-5">
-              <div className="flex items-center gap-2 pb-4 border-b border-slate-100">
-                <UserPlus className="h-5 w-5 text-amber-500" />
-                <h2 className="text-lg font-bold text-slate-800">Tambah Akun Guru Baru</h2>
-              </div>
-
-              {userError && (
-                <div className="bg-rose-500/10 border border-rose-500/20 text-rose-700 p-3 rounded-xl text-xs flex items-start gap-2">
-                  <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
-                  <span>{userError}</span>
-                </div>
-              )}
-
-              {userSuccess && (
-                <div className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-700 p-3 rounded-xl text-xs flex items-center gap-2">
-                  <Sparkles className="h-4 w-4 shrink-0" />
-                  <span>{userSuccess}</span>
-                </div>
-              )}
-
-              <form onSubmit={async (e) => {
-                e.preventDefault();
-                if (!newUserName || !newUserEmail || !newUserPassword) {
-                  setUserError("Silakan lengkapi semua isian.");
-                  return;
-                }
-                setUserError(null);
-                setUserSuccess(null);
-                setIsAddingUser(true);
-                try {
-                  await createNewUserByAdmin(newUserEmail.trim(), newUserPassword, newUserName, newUserRole, newUserRole === 'user' ? newUserMataPelajaran : 'Sosiologi');
-                  setUserSuccess(`Akun ${newUserName} (${newUserRole === 'admin' ? 'Admin' : 'Guru'}) berhasil didaftarkan!`);
-                  setNewUserName('');
-                  setNewUserEmail('');
-                  setNewUserPassword('');
-                  setNewUserRole('user');
-                  setNewUserMataPelajaran('Sosiologi');
-                } catch (err: any) {
-                  console.error(err);
-                  if (err.code === 'auth/email-already-in-use' || err.message?.includes('email-already-in-use')) {
-                    setUserError(`Alamat email (${newUserEmail.trim()}) sudah terdaftar dalam sistem.`);
-                  } else if (err.code === 'auth/weak-password' || err.message?.includes('weak-password')) {
-                    setUserError("Password terlalu lemah (minimal 6 karakter).");
-                  } else {
-                    setUserError(`Gagal membuat akun: ${err.message || err}`);
-                  }
-                } finally {
-                  setIsAddingUser(false);
-                }
-              }} className="space-y-4">
-                <div>
-                  <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Nama Lengkap Guru</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="Contoh: Budi Santoso, S.Pd."
-                    value={newUserName}
-                    onChange={(e) => setNewUserName(e.target.value)}
-                    className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-4 py-2.5 text-xs text-slate-800"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Alamat Email Resmi</label>
-                  <input
-                    type="email"
-                    required
-                    placeholder="nama.guru@sekolah.sch.id"
-                    value={newUserEmail}
-                    onChange={(e) => setNewUserEmail(e.target.value)}
-                    className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-4 py-2.5 text-xs text-slate-800"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Password Baru</label>
-                  <input
-                    type="password"
-                    required
-                    placeholder="Minimal 6 karakter"
-                    value={newUserPassword}
-                    onChange={(e) => setNewUserPassword(e.target.value)}
-                    className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-4 py-2.5 text-xs text-slate-800"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Peran Hak Akses (Role)</label>
-                  <div className="grid grid-cols-2 gap-3 mt-1.5">
-                    <button
-                      type="button"
-                      onClick={() => setNewUserRole('user')}
-                      className={`py-2 px-3 text-xs font-bold rounded-xl border flex items-center justify-center gap-1.5 transition ${
-                        newUserRole === 'user'
-                          ? 'bg-indigo-50 border-indigo-500 text-indigo-700'
-                          : 'bg-slate-50 border-slate-200 text-slate-500 hover:text-slate-800'
-                      }`}
-                    >
-                      <User className="h-4 w-4" />
-                      Guru Mapel
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setNewUserRole('admin')}
-                      className={`py-2 px-3 text-xs font-bold rounded-xl border flex items-center justify-center gap-1.5 transition ${
-                        newUserRole === 'admin'
-                          ? 'bg-indigo-50 border-indigo-500 text-indigo-700'
-                          : 'bg-slate-50 border-slate-200 text-slate-500 hover:text-slate-800'
-                      }`}
-                    >
-                      <Shield className="h-4 w-4" />
-                      Administrator
-                    </button>
+          <div id="users-panel" className="space-y-8 animate-fadeIn no-print">
+            {/* Top Banner: Apps Script Database Configuration */}
+            <section className="bg-gradient-to-r from-emerald-950 via-teal-900 to-slate-900 text-white rounded-3xl p-6 sm:p-8 shadow-xl border border-emerald-700/40 space-y-5">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-emerald-800/60 pb-5">
+                <div className="flex items-center gap-3">
+                  <div className="p-3 bg-emerald-500/20 border border-emerald-400/30 rounded-2xl text-emerald-300 shrink-0">
+                    <Database className="h-6 w-6" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h2 className="text-lg sm:text-xl font-extrabold tracking-tight">Database Pengguna: Google Apps Script</h2>
+                      <span className={`text-[10px] font-black px-2.5 py-0.5 rounded-full border uppercase tracking-wider ${
+                        getAppsScriptUrl()
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                          : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                      }`}>
+                        {getAppsScriptUrl() ? '🟢 Terhubung ke Google Sheets' : '🟡 Mode Penyimpanan Lokal'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-300 mt-1">
+                      Menggunakan Google Apps Script & Google Sheets sebagai backend database pengguna tanpa batas kuota harian.
+                    </p>
                   </div>
                 </div>
 
-                {newUserRole === 'user' && (
-                  <div>
-                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Mata Pelajaran Ampuan</label>
-                    <select
-                      value={newUserMataPelajaran}
-                      onChange={(e) => setNewUserMataPelajaran(e.target.value)}
-                      className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-4 py-2.5 text-xs text-slate-800 font-bold"
-                    >
-                      <option value="Sosiologi">👥 Sosiologi</option>
-                      <option value="Matematika">📐 Matematika</option>
-                      <option value="Bahasa Indonesia">🇮🇩 Bahasa Indonesia</option>
-                      <option value="Bahasa Inggris">🇬🇧 Bahasa Inggris</option>
-                      <option value="Matematika Tingkat Lanjut">🚀 Matematika Tingkat Lanjut</option>
-                      <option value="Bahasa Indonesia Tingkat Lanjut">✍️ Bahasa Indonesia Tingkat Lanjut</option>
-                      <option value="Bahasa Inggris Tingkat Lanjut">🗣️ Bahasa Inggris Tingkat Lanjut</option>
-                      <option value="Fisika">⚛️ Fisika</option>
-                      <option value="Kimia">🧪 Kimia</option>
-                      <option value="Biologi">🧬 Biologi</option>
-                      <option value="PPKN">🏛️ PPKN</option>
-                      <option value="Ekonomi">📈 Ekonomi</option>
-                      <option value="Geografi">🗺️ Geografi</option>
-                      <option value="Sejarah Tingkat Lanjut">📜 Sejarah Tingkat Lanjut</option>
-                      <option value="Antropologi">🗿 Antropologi</option>
-                      <option value="Bahasa Jepang">🇯🇵 Bahasa Jepang</option>
-                      <option value="Produk Kreatif dan Kewirausahaan">🛠️ Produk Kreatif dan Kewirausahaan</option>
-                    </select>
+                <button
+                  type="button"
+                  onClick={() => setShowAppsScriptGuideModal(true)}
+                  className="bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-black text-xs px-4 py-2.5 rounded-xl shadow transition flex items-center justify-center gap-2 shrink-0"
+                >
+                  <FileCode className="h-4 w-4" />
+                  <span>📖 Panduan & Salin Kode Apps Script</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-end">
+                <div className="lg:col-span-8 space-y-1.5">
+                  <label className="block text-xs font-bold uppercase tracking-wider text-emerald-200">
+                    URL Web App Google Apps Script (`exec`)
+                  </label>
+                  <input
+                    type="url"
+                    placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+                    value={appsScriptUrlInput}
+                    onChange={(e) => {
+                      setAppsScriptUrlInput(e.target.value);
+                      setAppsScriptTestMsg(null);
+                    }}
+                    className="w-full bg-slate-900/90 border border-emerald-700/60 focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 rounded-xl px-4 py-2.5 text-xs text-emerald-100 placeholder-slate-500 font-mono"
+                  />
+                </div>
+
+                <div className="lg:col-span-4 flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={isTestingAppsScript || !appsScriptUrlInput.trim()}
+                    onClick={async () => {
+                      setIsTestingAppsScript(true);
+                      setAppsScriptTestMsg(null);
+                      const res = await testAppsScriptConnection(appsScriptUrlInput.trim());
+                      setAppsScriptTestMsg({
+                        success: res.success,
+                        text: res.message
+                      });
+                      setIsTestingAppsScript(false);
+                    }}
+                    className="flex-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 font-bold text-xs py-2.5 px-3 rounded-xl border border-slate-700 transition flex items-center justify-center gap-1.5"
+                  >
+                    {isTestingAppsScript ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5 text-amber-400" />}
+                    <span>Tes Koneksi</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setAppsScriptUrl(appsScriptUrlInput.trim());
+                      setAppsScriptTestMsg({
+                        success: true,
+                        text: appsScriptUrlInput.trim() 
+                          ? "URL Google Apps Script berhasil disimpan! Memuat data pengguna dari Google Sheets..." 
+                          : "URL Apps Script dikosongkan. Sistem beralih ke mode penyimpanan lokal/cache."
+                      });
+                      const users = await fetchUsersFromAppsScript();
+                      setUsersList(users);
+                    }}
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs py-2.5 px-3 rounded-xl shadow transition flex items-center justify-center gap-1.5"
+                  >
+                    <Save className="h-3.5 w-3.5" />
+                    <span>Simpan URL</span>
+                  </button>
+                </div>
+              </div>
+
+              {appsScriptTestMsg && (
+                <div className={`p-3 rounded-xl text-xs flex items-center gap-2 font-medium ${
+                  appsScriptTestMsg.success
+                    ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-200'
+                    : 'bg-rose-500/20 border border-rose-500/40 text-rose-200'
+                }`}>
+                  {appsScriptTestMsg.success ? <Check className="h-4 w-4 shrink-0 text-emerald-400" /> : <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />}
+                  <span>{appsScriptTestMsg.text}</span>
+                </div>
+              )}
+            </section>
+
+            {/* Grid 2 Column: Add Form & Users List */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+              {/* Left Col: Add User Form */}
+              <section className="lg:col-span-5 bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-5">
+                <div className="flex items-center gap-2 pb-4 border-b border-slate-100">
+                  <UserPlus className="h-5 w-5 text-amber-500" />
+                  <h2 className="text-lg font-bold text-slate-800">Tambah Akun Guru Baru</h2>
+                </div>
+
+                {userError && (
+                  <div className="bg-rose-500/10 border border-rose-500/20 text-rose-700 p-3 rounded-xl text-xs flex items-start gap-2">
+                    <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+                    <span>{userError}</span>
                   </div>
                 )}
 
-                <button
-                  type="submit"
-                  disabled={isAddingUser}
-                  className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-extrabold py-3 px-4 rounded-xl shadow-md transition flex items-center justify-center gap-2 text-xs"
-                >
-                  {isAddingUser ? (
-                    <>
-                      <RefreshCw className="h-4 w-4 animate-spin" />
-                      <span>Mendaftarkan Guru...</span>
-                    </>
-                  ) : (
-                    <>
-                      <UserPlus className="h-4 w-4" />
-                      <span>Daftarkan Guru Baru</span>
-                    </>
-                  )}
-                </button>
-              </form>
-            </section>
+                {userSuccess && (
+                  <div className="bg-emerald-500/10 border border-emerald-500/20 text-emerald-700 p-3 rounded-xl text-xs flex items-center gap-2">
+                    <Sparkles className="h-4 w-4 shrink-0" />
+                    <span>{userSuccess}</span>
+                  </div>
+                )}
 
-            {/* Right Col: Current Users List */}
-            <section className="lg:col-span-7 bg-white border border-slate-200 rounded-2xl shadow-sm p-6 flex flex-col space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
-                <div className="flex items-center gap-2">
-                  <Users className="h-5 w-5 text-indigo-600" />
-                  <h2 className="text-lg font-bold text-slate-800">Daftar Pengguna Sistem</h2>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="bg-indigo-50 text-indigo-700 text-[10px] font-black px-2.5 py-1 rounded-full uppercase tracking-wider">
-                    {usersList.length} Pengguna
-                  </span>
-                  {/* Batch Upload Button */}
-                  <label className="cursor-pointer bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition">
-                    <Upload className="h-3.5 w-3.5 text-slate-600" />
-                    <span>⚡ Impor CSV/JSON</span>
-                    <input 
-                      type="file" 
-                      accept=".csv,.json"
-                      className="hidden"
-                      onChange={async (e) => {
-                        const file = e.target.files?.[0];
-                        if (!file) return;
-                        setIsBatchImportingUsers(true);
-                        setUserError(null);
-                        setUserSuccess(null);
+                <form onSubmit={async (e) => {
+                  e.preventDefault();
+                  if (!newUserName || !newUserEmail || !newUserPassword) {
+                    setUserError("Silakan lengkapi semua isian.");
+                    return;
+                  }
+                  setUserError(null);
+                  setUserSuccess(null);
+                  setIsAddingUser(true);
+                  try {
+                    const result = await addUserToAppsScript({
+                      name: newUserName.trim(),
+                      email: newUserEmail.trim(),
+                      password: newUserPassword,
+                      role: newUserRole,
+                      mataPelajaran: newUserRole === 'user' ? newUserMataPelajaran : 'Sosiologi'
+                    });
+
+                    if (result.success) {
+                      setUserSuccess(`Akun ${newUserName} (${newUserRole === 'admin' ? 'Admin' : 'Guru'}) berhasil didaftarkan!`);
+                      setNewUserName('');
+                      setNewUserEmail('');
+                      setNewUserPassword('');
+                      setNewUserRole('user');
+                      setNewUserMataPelajaran('Sosiologi');
+                      const updatedUsers = await fetchUsersFromAppsScript();
+                      setUsersList(updatedUsers);
+                    } else {
+                      setUserError(result.message || "Gagal mendaftarkan pengguna baru.");
+                    }
+                  } catch (err: any) {
+                    console.error(err);
+                    setUserError(`Gagal membuat akun: ${err.message || err}`);
+                  } finally {
+                    setIsAddingUser(false);
+                  }
+                }} className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Nama Lengkap Guru</label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="Contoh: Budi Santoso, S.Pd."
+                      value={newUserName}
+                      onChange={(e) => setNewUserName(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-4 py-2.5 text-xs text-slate-800"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Alamat Email Resmi</label>
+                    <input
+                      type="email"
+                      required
+                      placeholder="nama.guru@sekolah.sch.id"
+                      value={newUserEmail}
+                      onChange={(e) => setNewUserEmail(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-4 py-2.5 text-xs text-slate-800"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Password Baru</label>
+                    <input
+                      type="password"
+                      required
+                      placeholder="Minimal 6 karakter"
+                      value={newUserPassword}
+                      onChange={(e) => setNewUserPassword(e.target.value)}
+                      className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-4 py-2.5 text-xs text-slate-800"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Peran Hak Akses (Role)</label>
+                    <div className="grid grid-cols-2 gap-3 mt-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setNewUserRole('user')}
+                        className={`py-2 px-3 text-xs font-bold rounded-xl border flex items-center justify-center gap-1.5 transition ${
+                          newUserRole === 'user'
+                            ? 'bg-indigo-50 border-indigo-500 text-indigo-700'
+                            : 'bg-slate-50 border-slate-200 text-slate-500 hover:text-slate-800'
+                        }`}
+                      >
+                        <User className="h-4 w-4" />
+                        Guru Mapel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setNewUserRole('admin')}
+                        className={`py-2 px-3 text-xs font-bold rounded-xl border flex items-center justify-center gap-1.5 transition ${
+                          newUserRole === 'admin'
+                            ? 'bg-indigo-50 border-indigo-500 text-indigo-700'
+                            : 'bg-slate-50 border-slate-200 text-slate-500 hover:text-slate-800'
+                        }`}
+                      >
+                        <Shield className="h-4 w-4" />
+                        Administrator
+                      </button>
+                    </div>
+                  </div>
+
+                  {newUserRole === 'user' && (
+                    <div>
+                      <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Mata Pelajaran Ampuan</label>
+                      <select
+                        value={newUserMataPelajaran}
+                        onChange={(e) => setNewUserMataPelajaran(e.target.value)}
+                        className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-4 py-2.5 text-xs text-slate-800 font-bold"
+                      >
+                        <option value="Sosiologi">👥 Sosiologi</option>
+                        <option value="Matematika">📐 Matematika</option>
+                        <option value="Bahasa Indonesia">🇮🇩 Bahasa Indonesia</option>
+                        <option value="Bahasa Inggris">🇬🇧 Bahasa Inggris</option>
+                        <option value="Matematika Tingkat Lanjut">🚀 Matematika Tingkat Lanjut</option>
+                        <option value="Bahasa Indonesia Tingkat Lanjut">✍️ Bahasa Indonesia Tingkat Lanjut</option>
+                        <option value="Bahasa Inggris Tingkat Lanjut">🗣️ Bahasa Inggris Tingkat Lanjut</option>
+                        <option value="Fisika">⚛️ Fisika</option>
+                        <option value="Kimia">🧪 Kimia</option>
+                        <option value="Biologi">🧬 Biologi</option>
+                        <option value="PPKN">🏛️ PPKN</option>
+                        <option value="Ekonomi">📈 Ekonomi</option>
+                        <option value="Geografi">🗺️ Geografi</option>
+                        <option value="Sejarah Tingkat Lanjut">📜 Sejarah Tingkat Lanjut</option>
+                        <option value="Antropologi">🗿 Antropologi</option>
+                        <option value="Bahasa Jepang">🇯🇵 Bahasa Jepang</option>
+                        <option value="Produk Kreatif dan Kewirausahaan">🛠️ Produk Kreatif dan Kewirausahaan</option>
+                      </select>
+                    </div>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={isAddingUser}
+                    className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-extrabold py-3 px-4 rounded-xl shadow-md transition flex items-center justify-center gap-2 text-xs"
+                  >
+                    {isAddingUser ? (
+                      <>
+                        <RefreshCw className="h-4 w-4 animate-spin" />
+                        <span>Mendaftarkan Guru...</span>
+                      </>
+                    ) : (
+                      <>
+                        <UserPlus className="h-4 w-4" />
+                        <span>Daftarkan Guru Baru</span>
+                      </>
+                    )}
+                  </button>
+                </form>
+              </section>
+
+              {/* Right Col: Current Users List */}
+              <section className="lg:col-span-7 bg-white border border-slate-200 rounded-2xl shadow-sm p-6 flex flex-col space-y-4">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
+                  <div className="flex items-center gap-2">
+                    <Users className="h-5 w-5 text-indigo-600" />
+                    <h2 className="text-lg font-bold text-slate-800">Daftar Pengguna Sistem</h2>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="bg-indigo-50 text-indigo-700 text-[10px] font-black px-2.5 py-1 rounded-full uppercase tracking-wider">
+                      {usersList.length} Pengguna
+                    </span>
+
+                    {/* Download Template Excel Button */}
+                    <button
+                      type="button"
+                      onClick={() => {
                         try {
-                          const text = await file.text();
-                          let count = 0;
-                          let skipped = 0;
-                          if (file.name.endsWith('.json')) {
-                            const data = JSON.parse(text);
-                            const userArray = Array.isArray(data) ? data : [data];
-                            for (const item of userArray) {
-                              if (item.email && item.password) {
-                                try {
-                                  await createNewUserByAdmin(item.email, item.password, item.name || 'Guru', item.role || 'user', item.mataPelajaran || 'Sosiologi');
-                                  count++;
-                                } catch (itemErr: any) {
-                                  if (itemErr.code === 'auth/email-already-in-use' || itemErr.message?.includes('email-already-in-use')) {
-                                    skipped++;
-                                  } else {
-                                    throw itemErr;
-                                  }
-                                }
-                              }
+                          const templateData = [
+                            {
+                              "Nama": "Budi Santoso, S.Pd.",
+                              "Email": "budi.santoso@sekolah.sch.id",
+                              "Password": "password123",
+                              "Role": "user",
+                              "Mata Pelajaran": "Sosiologi"
+                            },
+                            {
+                              "Nama": "Siti Rahma, M.Pd.",
+                              "Email": "siti.rahma@sekolah.sch.id",
+                              "Password": "password123",
+                              "Role": "admin",
+                              "Mata Pelajaran": "Matematika"
                             }
-                          } else {
-                            // CSV Parsing
-                            const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
-                            for (let i = 0; i < lines.length; i++) {
-                              const cols = lines[i].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
-                              if (cols.length >= 3) {
-                                const [name, email, pass, roleVal, mapelVal] = cols;
-                                if (email && email.includes('@') && pass) {
-                                  try {
-                                    await createNewUserByAdmin(email, pass, name || 'Guru', (roleVal === 'admin' ? 'admin' : 'user'), mapelVal || 'Sosiologi');
-                                    count++;
-                                  } catch (itemErr: any) {
-                                    if (itemErr.code === 'auth/email-already-in-use' || itemErr.message?.includes('email-already-in-use')) {
-                                      skipped++;
-                                    } else {
-                                      throw itemErr;
-                                    }
-                                  }
-                                }
-                              }
-                            }
-                          }
-                          if (skipped > 0) {
-                            setUserSuccess(`Mengimpor ${count} akun baru (${skipped} akun dilewati karena email sudah terdaftar).`);
-                          } else {
-                            setUserSuccess(`Berhasil mengimpor batch ${count} akun pengguna!`);
-                          }
+                          ];
+                          const ws = XLSX.utils.json_to_sheet(templateData);
+                          const wb = XLSX.utils.book_new();
+                          XLSX.utils.book_append_sheet(wb, ws, "Template Pengguna");
+                          XLSX.writeFile(wb, "Template_Import_Pengguna_TKA.xlsx");
                         } catch (err: any) {
-                          console.error(err);
-                          setUserError(`Gagal impor batch pengguna: ${err.message || err}`);
-                        } finally {
-                          setIsBatchImportingUsers(false);
+                          console.error("Gagal mengunduh template excel:", err);
                         }
                       }}
-                    />
-                  </label>
-                </div>
-              </div>
+                      className="bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition"
+                      title="Unduh contoh format file Excel untuk impor akun pengguna"
+                    >
+                      <Download className="h-3.5 w-3.5 text-slate-600" />
+                      <span>Template Excel</span>
+                    </button>
 
-              {/* Search filter input */}
-              <div>
-                <input
-                  type="text"
-                  placeholder="🔍 Cari berdasarkan nama, email, atau mata pelajaran..."
-                  value={userSearchQuery}
-                  onChange={(e) => setUserSearchQuery(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 rounded-xl px-3.5 py-2 text-xs text-slate-800"
-                />
-              </div>
+                    {/* Batch Impor Excel / CSV / JSON Button */}
+                    <label className="cursor-pointer bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm border border-emerald-600 px-3 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1.5 transition">
+                      {isBatchImportingUsers ? (
+                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Upload className="h-3.5 w-3.5" />
+                      )}
+                      <span>📊 IMPOR EXCEL / CSV</span>
+                      <input 
+                        type="file" 
+                        accept=".xlsx,.xls,.csv,.json"
+                        className="hidden"
+                        disabled={isBatchImportingUsers}
+                        onChange={async (e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          setIsBatchImportingUsers(true);
+                          setUserError(null);
+                          setUserSuccess(null);
+                          try {
+                            let userItems: Array<{ name: string; email: string; password?: string; role?: string; mataPelajaran?: string }> = [];
 
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="border-b border-slate-150 text-slate-500 font-bold uppercase tracking-wider text-[10px]">
-                      <th className="py-3 px-2">Nama Pengguna</th>
-                      <th className="py-3 px-2">Email</th>
-                      <th className="py-3 px-2">Role</th>
-                      <th className="py-3 px-2 text-right">Aksi CRUD</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {usersList
-                      .filter((usr) => {
-                        if (!userSearchQuery) return true;
-                        const q = userSearchQuery.toLowerCase();
-                        return (usr.name || '').toLowerCase().includes(q) ||
-                               (usr.email || '').toLowerCase().includes(q) ||
-                               (usr.mataPelajaran || '').toLowerCase().includes(q);
-                      })
-                      .map((usr) => (
-                      <tr key={usr.id} className="hover:bg-slate-50/50 transition">
-                        <td className="py-3.5 px-2 font-bold text-slate-800">
-                          <div>{usr.name || 'Guru Sosiologi'}</div>
-                          {usr.role !== 'admin' && (
-                            <div className="text-[10px] text-indigo-600 font-medium mt-0.5 flex items-center gap-1">
-                              <BookOpen className="h-3 w-3 text-indigo-500 shrink-0" />
-                              <span>Mapel Ampuan: <b>{usr.mataPelajaran || 'Sosiologi'}</b></span>
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-3.5 px-2 text-slate-600">{usr.email}</td>
-                        <td className="py-3.5 px-2">
-                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-bold text-[9px] uppercase tracking-wide ${
-                            usr.role === 'admin'
-                              ? 'bg-amber-50 text-amber-700 border border-amber-200'
-                              : 'bg-indigo-50 text-indigo-700 border border-indigo-200'
-                          }`}>
-                            {usr.role === 'admin' ? <Shield className="h-2.5 w-2.5" /> : <User className="h-2.5 w-2.5" />}
-                            {usr.role === 'admin' ? 'Admin' : 'Guru'}
-                          </span>
-                        </td>
-                        <td className="py-3.5 px-2 text-right">
-                          <div className="flex items-center justify-end gap-1.5">
-                            {/* Edit Button */}
-                            <button
-                              onClick={() => setEditingUser({
-                                id: usr.id,
-                                name: usr.name || '',
-                                email: usr.email || '',
-                                role: usr.role || 'user',
-                                mataPelajaran: usr.mataPelajaran || 'Sosiologi'
-                              })}
-                              className="p-1.5 rounded-lg border bg-indigo-50 hover:bg-indigo-100 text-indigo-600 border-indigo-200 hover:border-indigo-300 transition"
-                              title="Ubah Nama, Peran & Mapel Ampuan"
-                            >
-                              <Edit className="h-3.5 w-3.5" />
-                            </button>
+                            if (file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+                              const buffer = await file.arrayBuffer();
+                              const workbook = XLSX.read(buffer, { type: 'array' });
+                              const firstSheetName = workbook.SheetNames[0];
+                              const worksheet = workbook.Sheets[firstSheetName];
+                              const rawData = XLSX.utils.sheet_to_json<any>(worksheet);
 
-                            {/* Delete Button */}
-                            <button
-                              disabled={usr.email === currentUser?.email}
-                              onClick={async () => {
-                                if (confirm(`Apakah Anda yakin ingin menghapus akses pengguna ${usr.name || usr.email}?`)) {
-                                  try {
-                                    await deleteDoc(doc(db, 'users', usr.id));
-                                  } catch (err) {
-                                    console.error("Gagal menghapus pengguna:", err);
-                                    alert("Gagal menghapus pengguna dari database.");
-                                  }
+                              userItems = rawData.map(row => ({
+                                name: String(row['Nama'] || row['nama'] || row['Nama Lengkap'] || row['Name'] || row['name'] || 'Guru').trim(),
+                                email: String(row['Email'] || row['email'] || row['Alamat Email'] || '').trim(),
+                                password: String(row['Password'] || row['password'] || row['Pass'] || row['pass'] || 'guru123').trim(),
+                                role: String(row['Role'] || row['role'] || row['Peran'] || 'user').toLowerCase().includes('admin') ? 'admin' : 'user',
+                                mataPelajaran: String(row['Mata Pelajaran'] || row['mataPelajaran'] || row['Mapel'] || row['mapel'] || 'Sosiologi').trim()
+                              }));
+                            } else if (file.name.endsWith('.json')) {
+                              const text = await file.text();
+                              const data = JSON.parse(text);
+                              const userArray = Array.isArray(data) ? data : [data];
+                              userItems = userArray.map(item => ({
+                                name: item.name || item.Nama || 'Guru',
+                                email: item.email || item.Email || '',
+                                password: String(item.password || item.Password || 'guru123'),
+                                role: (item.role || item.Role || 'user').toString().toLowerCase().includes('admin') ? 'admin' : 'user',
+                                mataPelajaran: item.mataPelajaran || item.Mapel || 'Sosiologi'
+                              }));
+                            } else {
+                              // CSV Parsing
+                              const text = await file.text();
+                              const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
+                              for (let i = 0; i < lines.length; i++) {
+                                // Skip header row if present
+                                if (i === 0 && (lines[i].toLowerCase().includes('email') || lines[i].toLowerCase().includes('nama'))) {
+                                  continue;
                                 }
-                              }}
-                              className={`p-1.5 rounded-lg border transition ${
-                                usr.email === currentUser?.email
-                                  ? 'opacity-40 cursor-not-allowed bg-slate-100 border-slate-200 text-slate-400'
-                                  : 'bg-rose-50 hover:bg-rose-100 text-rose-600 border-rose-200 hover:border-rose-300'
-                              }`}
-                              title={usr.email === currentUser?.email ? "Anda tidak dapat menghapus akun Anda sendiri" : "Hapus Pengguna"}
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </div>
-                        </td>
+                                const cols = lines[i].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+                                if (cols.length >= 2) {
+                                  const [name, email, pass, roleVal, mapelVal] = cols;
+                                  userItems.push({
+                                    name: name || 'Guru',
+                                    email: email || '',
+                                    password: pass || 'guru123',
+                                    role: roleVal === 'admin' ? 'admin' : 'user',
+                                    mataPelajaran: mapelVal || 'Sosiologi'
+                                  });
+                                }
+                              }
+                            }
+
+                            let count = 0;
+                            let skipped = 0;
+                            for (const item of userItems) {
+                              if (item.email && item.email.includes('@')) {
+                                try {
+                                  const res = await addUserToAppsScript({
+                                    email: item.email,
+                                    password: item.password || 'guru123',
+                                    name: item.name || 'Guru',
+                                    role: item.role === 'admin' ? 'admin' : 'user',
+                                    mataPelajaran: item.mataPelajaran || 'Sosiologi'
+                                  });
+                                  if (res.success) count++; else skipped++;
+                                } catch (itemErr: any) {
+                                  skipped++;
+                                }
+                              } else {
+                                skipped++;
+                              }
+                            }
+
+                            const updatedUsers = await fetchUsersFromAppsScript();
+                            setUsersList(updatedUsers);
+
+                            if (count > 0) {
+                              if (skipped > 0) {
+                                setUserSuccess(`Berhasil mengimpor ${count} akun pengguna dari Excel/File (${skipped} akun dilewati/gagal).`);
+                              } else {
+                                setUserSuccess(`Berhasil mengimpor ${count} akun pengguna dari Excel/File!`);
+                              }
+                            } else {
+                              setUserError(`Tidak ada akun yang berhasil diimpor. Pastikan file Excel memiliki kolom: Nama, Email, Password, Role, Mata Pelajaran.`);
+                            }
+                          } catch (err: any) {
+                            console.error(err);
+                            setUserError(`Gagal impor file Excel/CSV: ${err.message || err}`);
+                          } finally {
+                            setIsBatchImportingUsers(false);
+                            // Reset input value
+                            e.target.value = '';
+                          }
+                        }}
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                {/* Search filter input */}
+                <div>
+                  <input
+                    type="text"
+                    placeholder="🔍 Cari berdasarkan nama, email, atau mata pelajaran..."
+                    value={userSearchQuery}
+                    onChange={(e) => setUserSearchQuery(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 rounded-xl px-3.5 py-2 text-xs text-slate-800"
+                  />
+                </div>
+
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="border-b border-slate-150 text-slate-500 font-bold uppercase tracking-wider text-[10px]">
+                        <th className="py-3 px-2">Nama Pengguna</th>
+                        <th className="py-3 px-2">Email</th>
+                        <th className="py-3 px-2">Role</th>
+                        <th className="py-3 px-2 text-right">Aksi CRUD</th>
                       </tr>
-                    ))}
-                    {usersList.length === 0 && (
-                      <tr>
-                        <td colSpan={4} className="text-center py-8 text-slate-400">
-                          Tidak ada pengguna terdaftar.
-                        </td>
-                      </tr>
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </section>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {usersList
+                        .filter((usr) => {
+                          if (!userSearchQuery) return true;
+                          const q = userSearchQuery.toLowerCase();
+                          return (usr.name || '').toLowerCase().includes(q) ||
+                                 (usr.email || '').toLowerCase().includes(q) ||
+                                 (usr.mataPelajaran || '').toLowerCase().includes(q);
+                        })
+                        .map((usr) => (
+                        <tr key={usr.id} className="hover:bg-slate-50/50 transition">
+                          <td className="py-3.5 px-2 font-bold text-slate-800">
+                            <div>{usr.name || 'Guru Sosiologi'}</div>
+                            {usr.role !== 'admin' && (
+                              <div className="text-[10px] text-indigo-600 font-medium mt-0.5 flex items-center gap-1">
+                                <BookOpen className="h-3 w-3 text-indigo-500 shrink-0" />
+                                <span>Mapel Ampuan: <b>{usr.mataPelajaran || 'Sosiologi'}</b></span>
+                              </div>
+                            )}
+                          </td>
+                          <td className="py-3.5 px-2 text-slate-600">{usr.email}</td>
+                          <td className="py-3.5 px-2">
+                            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-bold text-[9px] uppercase tracking-wide ${
+                              usr.role === 'admin'
+                                ? 'bg-amber-50 text-amber-700 border border-amber-200'
+                                : 'bg-indigo-50 text-indigo-700 border border-indigo-200'
+                            }`}>
+                              {usr.role === 'admin' ? <Shield className="h-2.5 w-2.5" /> : <User className="h-2.5 w-2.5" />}
+                              {usr.role === 'admin' ? 'Admin' : 'Guru'}
+                            </span>
+                          </td>
+                          <td className="py-3.5 px-2 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              {/* Edit Button */}
+                              <button
+                                onClick={() => setEditingUser({
+                                  id: usr.id,
+                                  name: usr.name || '',
+                                  email: usr.email || '',
+                                  role: usr.role || 'user',
+                                  mataPelajaran: usr.mataPelajaran || 'Sosiologi'
+                                })}
+                                className="p-1.5 rounded-lg border bg-indigo-50 hover:bg-indigo-100 text-indigo-600 border-indigo-200 hover:border-indigo-300 transition"
+                                title="Ubah Nama, Peran & Mapel Ampuan"
+                              >
+                                <Edit className="h-3.5 w-3.5" />
+                              </button>
+
+                              {/* Delete Button */}
+                              <button
+                                disabled={usr.email === currentUser?.email}
+                                onClick={async () => {
+                                  if (confirm(`Apakah Anda yakin ingin menghapus akses pengguna ${usr.name || usr.email}?`)) {
+                                    try {
+                                      const res = await deleteUserInAppsScript(usr.id, usr.email);
+                                      if (res.success) {
+                                        setUserSuccess(`Pengguna ${usr.name || usr.email} berhasil dihapus.`);
+                                        const updatedUsers = await fetchUsersFromAppsScript();
+                                        setUsersList(updatedUsers);
+                                      } else {
+                                        alert(`Gagal menghapus pengguna: ${res.message}`);
+                                      }
+                                    } catch (err) {
+                                      console.error("Gagal menghapus pengguna:", err);
+                                      alert("Gagal menghapus pengguna dari database.");
+                                    }
+                                  }
+                                }}
+                                className={`p-1.5 rounded-lg border transition ${
+                                  usr.email === currentUser?.email
+                                    ? 'opacity-40 cursor-not-allowed bg-slate-100 border-slate-200 text-slate-400'
+                                    : 'bg-rose-50 hover:bg-rose-100 text-rose-600 border-rose-200 hover:border-rose-300'
+                                }`}
+                                title={usr.email === currentUser?.email ? "Anda tidak dapat menghapus akun Anda sendiri" : "Hapus Pengguna"}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                      {usersList.length === 0 && (
+                        <tr>
+                          <td colSpan={4} className="text-center py-8 text-slate-400">
+                            Tidak ada pengguna terdaftar.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            </div>
 
             {/* Modal Edit User CRUD */}
             {editingUser && (
@@ -12784,55 +13006,27 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                         setIsSavingUserEdit(true);
                         try {
                           const updatedSubject = editingUser.mataPelajaran || 'Sosiologi';
-
-                          // 1. Update main user profile in 'users' collection
-                          await updateDoc(doc(db, 'users', editingUser.id), {
+                          const res = await updateUserInAppsScript({
+                            id: editingUser.id,
+                            email: editingUser.email,
                             name: editingUser.name,
                             role: editingUser.role,
-                            mataPelajaran: updatedSubject,
-                            updatedAt: new Date()
+                            mataPelajaran: updatedSubject
                           });
 
-                          // 2. Synchronize user_settings generator_config
-                          await setDoc(doc(db, 'user_settings', `${editingUser.id}_generator_config`), {
-                            mataPelajaran: updatedSubject
-                          }, { merge: true });
-
-                          // 3. Synchronize user_settings cbt_config
-                          await setDoc(doc(db, 'user_settings', `${editingUser.id}_cbt_config`), {
-                            mataPelajaran: updatedSubject
-                          }, { merge: true });
-
-                          // 4. Check if user's matrix has default reference items from old subject; if so, re-seed for new subject
-                          try {
-                            const kisiSnap = await getDocs(query(collection(db, 'kisi_kisi'), where('userId', '==', editingUser.id)));
-                            if (!kisiSnap.empty) {
-                              let hasCustomItems = false;
-                              kisiSnap.forEach((docSnap) => {
-                                if (!docSnap.id.includes('-ref-')) {
-                                  hasCustomItems = true;
-                                }
-                              });
-                              if (!hasCustomItems) {
-                                const batchDel = writeBatch(db);
-                                kisiSnap.forEach((docSnap) => batchDel.delete(docSnap.ref));
-                                await batchDel.commit();
-                                await seedDefaultData(editingUser.id, updatedSubject);
-                              }
-                            } else {
-                              await seedDefaultData(editingUser.id, updatedSubject);
+                          if (res.success) {
+                            if (editingUser.id === currentUser?.uid || editingUser.email === currentUser?.email) {
+                              setUserName(editingUser.name);
+                              setUserRole(editingUser.role);
+                              setConfig(prev => ({ ...prev, mataPelajaran: updatedSubject }));
                             }
-                          } catch (seedErr) {
-                            console.warn("Auto-reseed matrix warning:", seedErr);
+                            setUserSuccess(`Profil dan Mata Pelajaran Ampuan "${editingUser.name}" berhasil diperbarui!`);
+                            setEditingUser(null);
+                            const updatedUsers = await fetchUsersFromAppsScript();
+                            setUsersList(updatedUsers);
+                          } else {
+                            alert(`Gagal menyimpan perubahan: ${res.message}`);
                           }
-
-                          if (editingUser.id === currentUser?.uid) {
-                            setUserName(editingUser.name);
-                            setUserRole(editingUser.role);
-                            setConfig(prev => ({ ...prev, mataPelajaran: updatedSubject }));
-                          }
-                          setUserSuccess(`Profil dan Mata Pelajaran Ampuan "${editingUser.name}" berhasil diperbarui menjadi ${updatedSubject}!`);
-                          setEditingUser(null);
                         } catch (err: any) {
                           console.error(err);
                           alert(`Gagal menyimpan perubahan: ${err.message}`);
@@ -12844,6 +13038,100 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                     >
                       {isSavingUserEdit ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                       <span>Simpan Perubahan</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Modal Panduan & Kode Google Apps Script */}
+            {showAppsScriptGuideModal && (
+              <div className="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto animate-fadeIn">
+                <div className="bg-white border border-slate-200 rounded-3xl shadow-2xl max-w-3xl w-full my-8 overflow-hidden p-6 sm:p-8 space-y-6">
+                  <div className="flex justify-between items-start pb-4 border-b border-slate-100">
+                    <div className="flex items-center gap-3">
+                      <div className="p-2.5 bg-emerald-100 text-emerald-700 rounded-2xl">
+                        <FileCode className="h-6 w-6" />
+                      </div>
+                      <div>
+                        <h3 className="text-lg font-black text-slate-800">Panduan Setup Google Apps Script Database</h3>
+                        <p className="text-xs text-slate-500">Gratis 100% tanpa batas kuota Firestore dan tanpa kartu kredit.</p>
+                      </div>
+                    </div>
+                    <button 
+                      onClick={() => setShowAppsScriptGuideModal(false)}
+                      className="text-slate-400 hover:text-slate-600 p-1.5 rounded-full hover:bg-slate-100 transition"
+                    >
+                      <X className="h-5 w-5" />
+                    </button>
+                  </div>
+
+                  <div className="space-y-4 text-xs text-slate-600 leading-relaxed max-h-[60vh] overflow-y-auto pr-2">
+                    <div className="bg-amber-50 border border-amber-200 p-4 rounded-2xl text-amber-900 space-y-1">
+                      <p className="font-bold flex items-center gap-1.5">
+                        <Sparkles className="h-4 w-4 text-amber-600" />
+                        Mengapa Memakai Google Apps Script?
+                      </p>
+                      <p className="text-[11px]">
+                        Google Apps Script menyimpan seluruh data akun pengguna secara langsung di Google Sheets milik Anda.
+                        Ini sepenuhnya gratis, tidak pernah terkena error "Quota Exceeded", dan data Anda tersimpan aman di Google Drive milik Anda sendiri.
+                      </p>
+                    </div>
+
+                    <ol className="space-y-4 list-decimal list-inside font-medium text-slate-700">
+                      <li className="space-y-1">
+                        <b>Buat Google Spreadsheet Baru:</b>
+                        <p className="text-slate-500 pl-5">Buka <a href="https://sheets.new" target="_blank" rel="noreferrer" className="text-indigo-600 font-bold underline">sheets.new</a> untuk membuat file Google Sheets baru. Beri nama file (contoh: <code>Database Users TKA SMA</code>).</p>
+                      </li>
+
+                      <li className="space-y-1">
+                        <b>Buka Editor Apps Script:</b>
+                        <p className="text-slate-500 pl-5">Di Google Sheets, klik menu <b>Ekstensi</b> &gt; <b>Apps Script</b>.</p>
+                      </li>
+
+                      <li className="space-y-2">
+                        <b>Salin Kode Apps Script di Bawah Ini:</b>
+                        <div className="relative bg-slate-900 text-slate-100 p-4 rounded-2xl font-mono text-[11px] overflow-x-auto border border-slate-800">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard.writeText(DEFAULT_APPSCRIPT_CODE);
+                              setIsCopyingScriptCode(true);
+                              setTimeout(() => setIsCopyingScriptCode(false), 2000);
+                            }}
+                            className="absolute top-3 right-3 bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-bold text-[10px] px-3 py-1.5 rounded-lg shadow transition flex items-center gap-1"
+                          >
+                            {isCopyingScriptCode ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                            <span>{isCopyingScriptCode ? 'Tersalin!' : 'Salin Kode'}</span>
+                          </button>
+                          <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap">{DEFAULT_APPSCRIPT_CODE}</pre>
+                        </div>
+                      </li>
+
+                      <li className="space-y-1">
+                        <b>Simpan & Deploy (Terapkan) sebagai Aplikasi Web:</b>
+                        <p className="text-slate-500 pl-5">Hapus kode bawaan di editor Apps Script, tempel kode di atas, lalu klik tombol <b>Simpan (💾)</b>.</p>
+                        <p className="text-slate-500 pl-5">Klik tombol <b>Terapkan (Deploy)</b> &gt; <b>Penataan baru (New deployment)</b>.</p>
+                        <p className="text-slate-500 pl-5">Pilih jenis: <b>Aplikasi Web (Web app)</b>.</p>
+                        <p className="text-slate-500 pl-5">Atur <b>Jalankan sebagai (Execute as): Saya (Me)</b>.</p>
+                        <p className="text-slate-500 pl-5 font-bold text-emerald-700">Atur Siapa yang memiliki akses (Who has access): Siapa saja (Anyone).</p>
+                      </li>
+
+                      <li className="space-y-1">
+                        <b>Salin URL Web App:</b>
+                        <p className="text-slate-500 pl-5">Klik <b>Terapkan</b>, izinkan akses akun Google jika diminta, lalu salin URL Aplikasi Web yang berakhiran <code>/exec</code>.</p>
+                        <p className="text-slate-500 pl-5">Tempelkan URL tersebut pada kolom input URL di panel Admin ini lalu klik <b>Simpan URL</b>.</p>
+                      </li>
+                    </ol>
+                  </div>
+
+                  <div className="flex justify-end pt-4 border-t border-slate-100">
+                    <button
+                      type="button"
+                      onClick={() => setShowAppsScriptGuideModal(false)}
+                      className="bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold px-6 py-2.5 rounded-xl shadow text-xs transition"
+                    >
+                      Saya Mengerti & Siap Gunakan
                     </button>
                   </div>
                 </div>

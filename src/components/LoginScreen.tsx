@@ -1,10 +1,6 @@
 import React, { useState } from 'react';
 import { motion } from 'motion/react';
-import { 
-  signInWithEmailAndPassword 
-} from 'firebase/auth';
-import { doc, setDoc, getDoc } from 'firebase/firestore';
-import { auth, db } from '../lib/firebase';
+import { loginWithAppsScript } from '../lib/userManagement';
 import { 
   Lock, 
   Mail, 
@@ -18,7 +14,7 @@ import {
 } from 'lucide-react';
 
 interface LoginScreenProps {
-  onLoginSuccess: (role: 'admin' | 'user', name: string) => void;
+  onLoginSuccess: (role: 'admin' | 'user', name: string, userObj?: any) => void;
 }
 
 export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
@@ -30,59 +26,6 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
-  const handleFetchUserProfileAndCallback = async (uid: string, fallbackEmail: string) => {
-    try {
-      const userDocRef = doc(db, 'users', uid);
-      const userDocSnap = await getDoc(userDocRef);
-      
-      let userRole: 'admin' | 'user' = 'user';
-      let displayName = fallbackEmail.split('@')[0];
-
-      if (userDocSnap.exists()) {
-        const data = userDocSnap.data();
-        userRole = data.role === 'admin' ? 'admin' : 'user';
-        displayName = data.name || displayName;
-      } else {
-        // Fallback or setup for default demo emails
-        if (fallbackEmail === 'admin@tka.com') {
-          userRole = 'admin';
-          displayName = 'Admin TKA SMA';
-        } else if (fallbackEmail === 'user@tka.com') {
-          userRole = 'user';
-          displayName = 'Guru Sosiologi';
-        }
-        
-        // Save fallback profile
-        await setDoc(userDocRef, {
-          uid,
-          email: fallbackEmail,
-          name: displayName,
-          role: userRole,
-          createdAt: new Date()
-        });
-      }
-
-      onLoginSuccess(userRole, displayName);
-    } catch (err: any) {
-      const isQuotaErr = (err?.message || String(err)).toLowerCase().includes('quota');
-      if (isQuotaErr) {
-        console.warn("Firestore quota exceeded during login profile load:", err?.message || err);
-      } else {
-        console.warn("User profile fetch notice:", err);
-      }
-      
-      let userRole: 'admin' | 'user' = fallbackEmail === 'admin@tka.com' ? 'admin' : 'user';
-      let displayName = fallbackEmail === 'admin@tka.com' ? 'Admin TKA SMA' : (fallbackEmail === 'user@tka.com' ? 'Guru Sosiologi' : fallbackEmail.split('@')[0]);
-
-      if (isQuotaErr) {
-        // Fallback gracefully on Firestore Quota Exceeded silently
-        onLoginSuccess(userRole, displayName);
-      } else {
-        setError("Gagal memuat profil pengguna dari database.");
-      }
-    }
-  };
-
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!email || !password) {
@@ -91,28 +34,17 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
     }
     setLoading(true);
     setError(null);
-    try {
-      const userCredential = await signInWithEmailAndPassword(auth, email.trim(), password);
-      await handleFetchUserProfileAndCallback(userCredential.user.uid, userCredential.user.email || email);
-    } catch (err: any) {
-      console.warn("Login attempt error:", err?.code || err?.message);
-      const isInvalidCred = 
-        err.code === 'auth/user-not-found' || 
-        err.code === 'auth/wrong-password' || 
-        err.code === 'auth/invalid-credential' || 
-        err.code === 'auth/invalid-login-credentials' ||
-        (err.message && (
-          err.message.includes('invalid-credential') || 
-          err.message.includes('invalid-login-credentials') ||
-          err.message.includes('user-not-found') ||
-          err.message.includes('wrong-password')
-        ));
 
-      if (isInvalidCred) {
-        setError("Email atau Password yang Anda masukkan salah. Silakan hubungi Administrator jika Anda belum memiliki akun.");
+    try {
+      const res = await loginWithAppsScript(email, password);
+      if (res.success && res.user) {
+        onLoginSuccess(res.user.role, res.user.name, res.user);
       } else {
-        setError(`Gagal Masuk: ${err.message || err}`);
+        setError(res.message || "Email atau Password yang Anda masukkan salah.");
       }
+    } catch (err: any) {
+      console.warn("Login attempt error:", err);
+      setError(`Gagal Masuk: ${err.message || err}`);
     } finally {
       setLoading(false);
     }
