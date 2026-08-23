@@ -14,6 +14,7 @@ import {
   getSupabaseClient, 
   getStoredSupabaseConfig, 
   saveStoredSupabaseConfig, 
+  isValidHttpUrl,
   SUPABASE_SQL_SETUP_CODE 
 } from './supabase';
 
@@ -56,13 +57,23 @@ export { getStoredSupabaseConfig, saveStoredSupabaseConfig, SUPABASE_SQL_SETUP_C
  * Tests connection to Supabase database and checks if 'users' table exists
  */
 export async function testSupabaseConnection(url: string, key: string): Promise<{ success: boolean; message: string; count?: number }> {
-  if (!url.trim() || !key.trim()) {
+  const cleanUrl = url.trim();
+  const cleanKey = key.trim();
+
+  if (!cleanUrl || !cleanKey) {
     return { success: false, message: "URL dan Anon Key Supabase wajib diisi." };
+  }
+
+  if (!isValidHttpUrl(cleanUrl)) {
+    return { 
+      success: false, 
+      message: "Format Project URL tidak valid. Pastikan diawali dengan https:// (contoh: https://xyz.supabase.co)." 
+    };
   }
 
   try {
     const { createClient } = await import('@supabase/supabase-js');
-    const client = createClient(url.trim(), key.trim());
+    const client = createClient(cleanUrl, cleanKey);
 
     const { data, error } = await client
       .from('users')

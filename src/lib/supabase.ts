@@ -8,6 +8,20 @@ let currentSupabaseKey: string = '';
 const SUPABASE_STORAGE_URL_KEY = 'tka_supabase_url';
 const SUPABASE_STORAGE_ANON_KEY = 'tka_supabase_anon_key';
 
+export function isValidHttpUrl(urlString: string): boolean {
+  if (!urlString || typeof urlString !== 'string') return false;
+  const trimmed = urlString.trim();
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    return false;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:') && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 export function getStoredSupabaseConfig(): { url: string; key: string } {
   let url = '';
   let key = '';
@@ -26,7 +40,7 @@ export function getStoredSupabaseConfig(): { url: string; key: string } {
     key = String(metaEnv.VITE_SUPABASE_ANON_KEY).trim();
   }
 
-  return { url, key };
+  return { url: url.trim(), key: key.trim() };
 }
 
 export function saveStoredSupabaseConfig(url: string, key: string): void {
@@ -34,7 +48,7 @@ export function saveStoredSupabaseConfig(url: string, key: string): void {
   currentSupabaseKey = key.trim();
 
   if (typeof window !== 'undefined') {
-    if (currentSupabaseUrl) {
+    if (currentSupabaseUrl && isValidHttpUrl(currentSupabaseUrl)) {
       localStorage.setItem(SUPABASE_STORAGE_URL_KEY, currentSupabaseUrl);
     } else {
       localStorage.removeItem(SUPABASE_STORAGE_URL_KEY);
@@ -54,7 +68,7 @@ export function saveStoredSupabaseConfig(url: string, key: string): void {
 export function getSupabaseClient(): SupabaseClient | null {
   const { url, key } = getStoredSupabaseConfig();
 
-  if (!url || !key) {
+  if (!url || !key || !isValidHttpUrl(url)) {
     return null;
   }
 
@@ -73,7 +87,7 @@ export function getSupabaseClient(): SupabaseClient | null {
     });
     return supabaseInstance;
   } catch (err) {
-    console.error("Failed to initialize Supabase client:", err);
+    console.warn("Notice: Supabase client not initialized (using cloud fallback):", err);
     return null;
   }
 }
