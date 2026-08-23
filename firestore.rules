@@ -1,0 +1,90 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && (
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+      );
+    }
+
+    // Global default-deny catch-all rule
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Users Collection: Prevent self-assigned admin privilege escalation
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && (
+        request.auth.uid == userId && (
+          request.resource.data.role == 'user' ||
+          isAdmin() ||
+          (request.auth.token != null && request.auth.token.email == 'admin@tka.com')
+        )
+      );
+      allow update: if isAuthenticated() && (
+        isAdmin() || (
+          request.auth.uid == userId &&
+          (!request.resource.data.keys().hasAny(['role']) || request.resource.data.role == resource.data.role)
+        )
+      );
+      allow delete: if isAdmin();
+    }
+
+    // Kisi-kisi Collection: Restrict access to document owner or admin
+    match /kisi_kisi/{document} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // Questions Collection: Restrict access to document owner or admin
+    match /questions/{document} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // Materials Collection: Restrict access to document owner or admin
+    match /materials/{document} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+
+    // User Settings Collection: Restrict to doc matching userId prefix or owner
+    match /user_settings/{document} {
+      allow read: if isAuthenticated() && (
+        document.matches(request.auth.uid + '_.*') ||
+        (resource != null && resource.data.userId == request.auth.uid) ||
+        isAdmin()
+      );
+      allow create, update, delete: if isAuthenticated() && (
+        document.matches(request.auth.uid + '_.*') ||
+        (request.resource != null && request.resource.data.userId == request.auth.uid) ||
+        (resource != null && resource.data.userId == request.auth.uid) ||
+        isAdmin()
+      );
+    }
+
+    // App Settings Collection: Read by all authenticated users, write by admin only
+    match /app_settings/{document} {
+      allow read: if isAuthenticated();
+      allow write: if isAdmin();
+    }
+
+    // Schedule Collection: Restrict access to document owner or admin
+    match /jadwal_pembelajaran/{document} {
+      allow read: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if isAuthenticated() && (resource.data.userId == request.auth.uid || isAdmin());
+    }
+  }
+}
+
