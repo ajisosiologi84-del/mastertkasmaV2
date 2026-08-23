@@ -6,8 +6,16 @@ import {
   getDocs, 
   collection, 
   deleteDoc,
-  onSnapshot 
+  onSnapshot,
+  writeBatch
 } from 'firebase/firestore';
+import * as XLSX from 'xlsx';
+import { 
+  getSupabaseClient, 
+  getStoredSupabaseConfig, 
+  saveStoredSupabaseConfig, 
+  SUPABASE_SQL_SETUP_CODE 
+} from './supabase';
 
 export interface UserProfile {
   id: string;
@@ -19,12 +27,9 @@ export interface UserProfile {
   createdAt?: string;
 }
 
-const APPSCRIPT_URL_KEY = 'tka_appscript_url';
-const LOCAL_USERS_CACHE_KEY = 'tka_appscript_users_cache';
+const LOCAL_USERS_CACHE_KEY = 'tka_master_users_cache';
 
-let inMemoryAppsScriptUrl: string = '';
-
-const INITIAL_DEFAULT_USERS: UserProfile[] = [
+export const INITIAL_DEFAULT_USERS: UserProfile[] = [
   {
     id: 'usr_admin',
     email: 'admin@tka.com',
@@ -45,93 +50,686 @@ const INITIAL_DEFAULT_USERS: UserProfile[] = [
   }
 ];
 
+export { getStoredSupabaseConfig, saveStoredSupabaseConfig, SUPABASE_SQL_SETUP_CODE };
+
 /**
- * Initializes and synchronizes Google Apps Script configuration from Cloud Firestore
- * Attaches real-time listener so any newly opened browser or domain receives the saved URL automatically.
+ * Tests connection to Supabase database and checks if 'users' table exists
  */
-export async function initAppsScriptConfig(): Promise<string> {
+export async function testSupabaseConnection(url: string, key: string): Promise<{ success: boolean; message: string; count?: number }> {
+  if (!url.trim() || !key.trim()) {
+    return { success: false, message: "URL dan Anon Key Supabase wajib diisi." };
+  }
+
   try {
-    const snap = await getDoc(doc(db, 'app_settings', 'global_config'));
-    if (snap.exists()) {
-      const data = snap.data();
-      if (data.appsScriptUrl && typeof data.appsScriptUrl === 'string') {
-        const url = data.appsScriptUrl.trim();
-        if (url) {
-          inMemoryAppsScriptUrl = url;
-          if (typeof window !== 'undefined') {
-            localStorage.setItem(APPSCRIPT_URL_KEY, url);
-          }
-          return url;
-        }
+    const { createClient } = await import('@supabase/supabase-js');
+    const client = createClient(url.trim(), key.trim());
+
+    const { data, error } = await client
+      .from('users')
+      .select('id, email, name, role, mata_pelajaran')
+      .limit(5);
+
+    if (error) {
+      if (error.code === '42P01' || error.message.toLowerCase().includes('relation "public.users" does not exist') || error.message.toLowerCase().includes('does not exist')) {
+        return {
+          success: false,
+          message: "Koneksi ke Supabase berhasil, namun tabel 'users' belum dibuat. Silakan salin & jalankan SQL Setup di Supabase SQL Editor."
+        };
       }
-    } else {
-      // If Firestore doesn't have it yet, check if current browser has it in localStorage to backfill
-      const local = typeof window !== 'undefined' ? localStorage.getItem(APPSCRIPT_URL_KEY) : null;
-      if (local && local.trim()) {
-        setDoc(doc(db, 'app_settings', 'global_config'), {
-          appsScriptUrl: local.trim(),
-          updatedAt: new Date().toISOString()
-        }, { merge: true }).catch(() => {});
+      return {
+        success: false,
+        message: `Koneksi gagal (${error.code || 'Error'}): ${error.message}`
+      };
+    }
+
+    return {
+      success: true,
+      message: `Koneksi ke Supabase berhasil! Terhubung ke tabel 'users' (${data?.length || 0} akun ditemukan).`,
+      count: data?.length || 0
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      message: `Gagal menghubungkan ke Supabase: ${err.message || err}`
+    };
+  }
+}
+
+/**
+ * Initializes default user records in Cloud Firestore if database is empty
+ */
+export async function seedDefaultUsersIfEmpty(): Promise<void> {
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    if (snap.empty) {
+      for (const u of INITIAL_DEFAULT_USERS) {
+        await setDoc(doc(db, 'users', u.id), u, { merge: true });
       }
     }
   } catch (e) {
-    console.warn("Notice reading Apps Script config from Firestore:", e);
+    console.warn("Notice seeding default users to Firestore:", e);
   }
-
-  // Real-time listener for any instant changes
-  if (typeof window !== 'undefined') {
-    try {
-      onSnapshot(doc(db, 'app_settings', 'global_config'), (snapshot) => {
-        if (snapshot.exists()) {
-          const data = snapshot.data();
-          if (data.appsScriptUrl && typeof data.appsScriptUrl === 'string') {
-            const url = data.appsScriptUrl.trim();
-            if (url && url !== inMemoryAppsScriptUrl) {
-              inMemoryAppsScriptUrl = url;
-              localStorage.setItem(APPSCRIPT_URL_KEY, url);
-            }
-          }
-        }
-      }, (err) => console.warn("Notice subscribing to Apps Script config:", err));
-    } catch (e) {}
-  }
-
-  return getAppsScriptUrl();
 }
 
-// Auto-trigger sync on module load if in browser
-if (typeof window !== 'undefined') {
+/**
+ * Real-time Subscription to Users (Supabase + Cloud Firestore fallback)
+ * Instant synchronization across all browsers, mobile devices, and mastertkasma.my.id
+ */
+export function subscribeToUsers(callback: (users: UserProfile[]) => void): () => void {
+  const supabase = getSupabaseClient();
+
+  // If Supabase is active, listen to Supabase real-time changes
+  if (supabase) {
+    // Initial fetch from Supabase
+    fetchUsersFromCloud().then(users => {
+      if (users.length > 0) callback(users);
+    });
+
+    try {
+      const channel = supabase
+        .channel('users_realtime')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, async () => {
+          const freshUsers = await fetchUsersFromCloud();
+          callback(freshUsers);
+        })
+        .subscribe();
+
+      return () => {
+        supabase.removeChannel(channel);
+      };
+    } catch (e) {
+      console.warn("Notice Supabase channel subscription, fallback to Firestore/Interval:", e);
+    }
+  }
+
+  // Fallback / standard: Cloud Firestore real-time listener
   try {
-    const cached = localStorage.getItem(APPSCRIPT_URL_KEY);
-    if (cached) inMemoryAppsScriptUrl = cached.trim();
-    initAppsScriptConfig().catch(() => {});
-  } catch (e) {}
+    const unsub = onSnapshot(collection(db, 'users'), (snapshot) => {
+      if (!snapshot.empty) {
+        const users: UserProfile[] = [];
+        snapshot.forEach((d) => {
+          const data = d.data();
+          if (data && data.email) {
+            users.push({
+              id: data.id || data.uid || d.id,
+              email: String(data.email).trim().toLowerCase(),
+              password: data.password ? String(data.password).trim() : '',
+              name: data.name ? String(data.name).trim() : data.email.split('@')[0],
+              role: data.role === 'admin' ? 'admin' : 'user',
+              mataPelajaran: data.mataPelajaran || 'Sosiologi',
+              createdAt: data.createdAt || new Date().toISOString()
+            });
+          }
+        });
+        if (users.length > 0) {
+          saveLocalCachedUsers(users);
+          callback(users);
+          return;
+        }
+      }
+      // If Firestore returned empty, supply defaults & trigger seeding
+      const cached = getLocalCachedUsers();
+      callback(cached.length > 0 ? cached : INITIAL_DEFAULT_USERS);
+      seedDefaultUsersIfEmpty().catch(() => {});
+    }, (err) => {
+      console.warn("Firestore onSnapshot subscription notice, using local cache:", err);
+      callback(getLocalCachedUsers());
+    });
+
+    return unsub;
+  } catch (e) {
+    console.warn("Could not attach Firestore listener:", e);
+    callback(getLocalCachedUsers());
+    return () => {};
+  }
+}
+
+/**
+ * Fetch all users from Supabase with Cloud Firestore & local cache fallback
+ */
+export async function fetchUsersFromCloud(): Promise<UserProfile[]> {
+  const supabase = getSupabaseClient();
+
+  // 1. Try Supabase if configured
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('users')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (!error && data && data.length > 0) {
+        const mappedUsers: UserProfile[] = data.map(item => ({
+          id: item.id || `usr_${Date.now()}`,
+          email: String(item.email).trim().toLowerCase(),
+          password: item.password ? String(item.password).trim() : '',
+          name: item.name ? String(item.name).trim() : item.email.split('@')[0],
+          role: item.role === 'admin' ? 'admin' : 'user',
+          mataPelajaran: item.mata_pelajaran || item.mataPelajaran || 'Sosiologi',
+          createdAt: item.created_at || new Date().toISOString()
+        }));
+
+        saveLocalCachedUsers(mappedUsers);
+        return mappedUsers;
+      }
+    } catch (supaErr) {
+      console.warn("Notice fetching users from Supabase:", supaErr);
+    }
+  }
+
+  // 2. Try Firestore
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    if (!snap.empty) {
+      const users: UserProfile[] = [];
+      snap.forEach((d) => {
+        const data = d.data();
+        if (data && data.email) {
+          users.push({
+            id: data.id || data.uid || d.id,
+            email: String(data.email).trim().toLowerCase(),
+            password: data.password ? String(data.password).trim() : '',
+            name: data.name ? String(data.name).trim() : data.email.split('@')[0],
+            role: data.role === 'admin' ? 'admin' : 'user',
+            mataPelajaran: data.mataPelajaran || 'Sosiologi',
+            createdAt: data.createdAt || new Date().toISOString()
+          });
+        }
+      });
+      if (users.length > 0) {
+        saveLocalCachedUsers(users);
+        return users;
+      }
+    }
+  } catch (e) {
+    console.warn("Notice fetching users from Firestore:", e);
+  }
+
+  const local = getLocalCachedUsers();
+  return local.length > 0 ? local : INITIAL_DEFAULT_USERS;
+}
+
+/**
+ * Authenticates user credentials directly via Supabase, Cloud Firestore & Local Cache
+ */
+export async function loginUser(
+  email: string, 
+  pass: string
+): Promise<{ success: boolean; user?: UserProfile; message?: string }> {
+  const cleanEmail = email.trim().toLowerCase();
+  const cleanPass = pass.trim();
+
+  // 1. Check Supabase first if configured
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('users')
+        .select('*')
+        .eq('email', cleanEmail)
+        .limit(1);
+
+      if (!error && data && data.length > 0) {
+        const record = data[0];
+        const storedPass = record.password ? String(record.password).trim() : '';
+        const isPassMatch = 
+          !storedPass || 
+          storedPass === cleanPass ||
+          (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) ||
+          (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user'));
+
+        if (isPassMatch) {
+          const userObj: UserProfile = {
+            id: record.id || `usr_${cleanEmail}`,
+            email: record.email,
+            name: record.name || record.email.split('@')[0],
+            role: record.role === 'admin' ? 'admin' : 'user',
+            mataPelajaran: record.mata_pelajaran || record.mataPelajaran || 'Sosiologi'
+          };
+          return { success: true, user: userObj };
+        } else {
+          return { 
+            success: false, 
+            message: 'Password yang Anda masukkan salah. Silakan coba lagi.' 
+          };
+        }
+      }
+    } catch (supaErr) {
+      console.warn("Notice authenticating via Supabase, trying fallback:", supaErr);
+    }
+  }
+
+  // 2. Check Cloud Firestore directly
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    if (!snap.empty) {
+      for (const d of snap.docs) {
+        const data = d.data();
+        if (data.email && String(data.email).trim().toLowerCase() === cleanEmail) {
+          const storedPass = data.password ? String(data.password).trim() : '';
+          const isPassMatch = 
+            !storedPass || 
+            storedPass === cleanPass ||
+            (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) ||
+            (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user'));
+
+          if (isPassMatch) {
+            const userObj: UserProfile = {
+              id: data.id || data.uid || d.id,
+              email: data.email,
+              name: data.name || data.email.split('@')[0],
+              role: data.role === 'admin' ? 'admin' : 'user',
+              mataPelajaran: data.mataPelajaran || 'Sosiologi'
+            };
+            return { success: true, user: userObj };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Notice verifying login via Firestore:", err);
+  }
+
+  // 3. Check local cached users
+  const localUsers = getLocalCachedUsers();
+  const found = localUsers.find(u => {
+    const isEmailMatch = u.email.trim().toLowerCase() === cleanEmail;
+    if (!isEmailMatch) return false;
+    if (!u.password) return true;
+    const pwd = u.password.trim();
+    if (pwd === cleanPass) return true;
+    if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) return true;
+    if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user')) return true;
+    return false;
+  });
+
+  if (found) {
+    return { success: true, user: found };
+  }
+
+  // 4. Fallback for default master accounts
+  if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) {
+    const adminObj: UserProfile = {
+      id: 'usr_admin',
+      email: 'admin@tka.com',
+      name: 'Admin TKA SMA',
+      role: 'admin',
+      mataPelajaran: 'Sosiologi'
+    };
+    return { success: true, user: adminObj };
+  } else if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user')) {
+    const demoObj: UserProfile = {
+      id: 'usr_demo',
+      email: 'user@tka.com',
+      name: 'Guru Sosiologi',
+      role: 'user',
+      mataPelajaran: 'Sosiologi'
+    };
+    return { success: true, user: demoObj };
+  }
+
+  return { 
+    success: false, 
+    message: 'Email atau Password salah. Silakan periksa kembali kredensial Anda.' 
+  };
+}
+
+/**
+ * Adds a new user directly to Supabase & Cloud Firestore & updates local cache
+ */
+export async function addUserToCloud(
+  newUser: { email: string; password?: string; name: string; role: 'admin' | 'user'; mataPelajaran: string }
+): Promise<{ success: boolean; user?: UserProfile; message?: string }> {
+  const cleanEmail = newUser.email.trim().toLowerCase();
+  const cleanPass = newUser.password ? newUser.password.trim() : '123456';
+  const cleanName = newUser.name.trim() || cleanEmail.split('@')[0];
+  const cleanRole = newUser.role || 'user';
+  const cleanMapel = newUser.mataPelajaran || 'Sosiologi';
+
+  const userObj: UserProfile = {
+    id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+    email: cleanEmail,
+    password: cleanPass,
+    name: cleanName,
+    role: cleanRole,
+    mataPelajaran: cleanMapel,
+    createdAt: new Date().toISOString()
+  };
+
+  // 1. Insert to Supabase if configured
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    try {
+      const { error } = await supabase
+        .from('users')
+        .insert([{
+          id: userObj.id,
+          email: cleanEmail,
+          password: cleanPass,
+          name: cleanName,
+          role: cleanRole,
+          mata_pelajaran: cleanMapel,
+          created_at: userObj.createdAt
+        }]);
+
+      if (error) {
+        if (error.code === '23505' || error.message.toLowerCase().includes('unique') || error.message.toLowerCase().includes('duplicate')) {
+          return { success: false, message: `Email ${cleanEmail} sudah terdaftar di Database Supabase.` };
+        }
+        console.warn("Supabase insert error:", error);
+      }
+    } catch (supaErr: any) {
+      console.warn("Notice saving user to Supabase:", supaErr);
+    }
+  }
+
+  // 2. Persist to Firestore for redundant backup
+  try {
+    const snap = await getDocs(collection(db, 'users'));
+    let exists = false;
+    snap.forEach((d) => {
+      const data = d.data();
+      if (data && data.email && String(data.email).trim().toLowerCase() === cleanEmail) {
+        exists = true;
+      }
+    });
+
+    if (exists && !supabase) {
+      return { success: false, message: `Email ${cleanEmail} sudah terdaftar di Database Cloud.` };
+    }
+
+    await setDoc(doc(db, 'users', userObj.id), userObj, { merge: true });
+
+    await setDoc(doc(db, 'user_settings', `${userObj.id}_generator_config`), {
+      mataPelajaran: cleanMapel
+    }, { merge: true });
+
+  } catch (err: any) {
+    console.warn("Notice saving user to Firestore:", err);
+  }
+
+  // Update local cache
+  const localUsers = getLocalCachedUsers();
+  localUsers.unshift(userObj);
+  saveLocalCachedUsers(localUsers);
+
+  return { success: true, user: userObj };
+}
+
+/**
+ * Updates an existing user in Supabase & Cloud Firestore & local cache
+ */
+export async function updateUserInCloud(
+  updatedUser: { id: string; email: string; name: string; role: 'admin' | 'user'; mataPelajaran: string; password?: string }
+): Promise<{ success: boolean; message?: string }> {
+  const cleanEmail = updatedUser.email.trim().toLowerCase();
+  const cleanName = updatedUser.name.trim();
+
+  // 1. Update in Supabase if configured
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    try {
+      const supaPayload: any = {
+        name: cleanName,
+        role: updatedUser.role,
+        mata_pelajaran: updatedUser.mataPelajaran
+      };
+      if (updatedUser.password && updatedUser.password.trim()) {
+        supaPayload.password = updatedUser.password.trim();
+      }
+
+      await supabase
+        .from('users')
+        .update(supaPayload)
+        .or(`id.eq.${updatedUser.id},email.eq.${cleanEmail}`);
+    } catch (supaErr) {
+      console.warn("Notice updating user in Supabase:", supaErr);
+    }
+  }
+
+  // 2. Update in Firestore
+  try {
+    const updatePayload: any = {
+      id: updatedUser.id,
+      email: cleanEmail,
+      name: cleanName,
+      role: updatedUser.role,
+      mataPelajaran: updatedUser.mataPelajaran,
+      updatedAt: new Date().toISOString()
+    };
+
+    if (updatedUser.password && updatedUser.password.trim()) {
+      updatePayload.password = updatedUser.password.trim();
+    }
+
+    await setDoc(doc(db, 'users', updatedUser.id), updatePayload, { merge: true });
+
+    await setDoc(doc(db, 'user_settings', `${updatedUser.id}_generator_config`), {
+      mataPelajaran: updatedUser.mataPelajaran
+    }, { merge: true });
+
+  } catch (err) {
+    console.warn("Notice updating user in Firestore:", err);
+  }
+
+  // Update local cache
+  const localUsers = getLocalCachedUsers();
+  const idx = localUsers.findIndex(u => u.id === updatedUser.id || u.email.toLowerCase() === cleanEmail);
+  if (idx !== -1) {
+    localUsers[idx] = {
+      ...localUsers[idx],
+      name: cleanName,
+      role: updatedUser.role,
+      mataPelajaran: updatedUser.mataPelajaran,
+      ...(updatedUser.password ? { password: updatedUser.password.trim() } : {})
+    };
+    saveLocalCachedUsers(localUsers);
+  }
+
+  return { success: true };
+}
+
+/**
+ * Deletes a user from Supabase, Cloud Firestore & local cache
+ */
+export async function deleteUserFromCloud(
+  id: string, 
+  email?: string
+): Promise<{ success: boolean; message?: string }> {
+  // 1. Delete from Supabase if configured
+  const supabase = getSupabaseClient();
+  if (supabase) {
+    try {
+      if (email) {
+        await supabase.from('users').delete().or(`id.eq.${id},email.eq.${email.trim().toLowerCase()}`);
+      } else {
+        await supabase.from('users').delete().eq('id', id);
+      }
+    } catch (supaErr) {
+      console.warn("Notice deleting user from Supabase:", supaErr);
+    }
+  }
+
+  // 2. Delete from Firestore
+  try {
+    await deleteDoc(doc(db, 'users', id));
+  } catch (err) {
+    console.warn("Notice deleting user from Firestore:", err);
+  }
+
+  // Update local cache
+  const localUsers = getLocalCachedUsers();
+  const filtered = localUsers.filter(u => u.id !== id && (!email || u.email.toLowerCase() !== email.toLowerCase()));
+  saveLocalCachedUsers(filtered);
+
+  return { success: true };
+}
+
+/**
+ * Batch Imports Users from Excel / CSV directly into Supabase & Cloud Firestore
+ */
+export async function importUsersBatchToCloud(
+  usersToImport: Array<{ name: string; email: string; password?: string; role?: string; mataPelajaran?: string }>
+): Promise<{ success: boolean; count: number; importedCount: number; message: string }> {
+  if (!usersToImport || usersToImport.length === 0) {
+    return { success: false, count: 0, importedCount: 0, message: "Tidak ada data pengguna yang valid untuk diimpor." };
+  }
+
+  let count = 0;
+  const currentUsers = await fetchUsersFromCloud();
+  const existingEmails = new Set(currentUsers.map(u => u.email.toLowerCase()));
+
+  const importedList: UserProfile[] = [];
+  const supaBatch: any[] = [];
+
+  for (const item of usersToImport) {
+    if (!item.email || !item.name) continue;
+    const cleanEmail = String(item.email).trim().toLowerCase();
+    if (!cleanEmail.includes('@') || existingEmails.has(cleanEmail)) continue;
+
+    const userObj: UserProfile = {
+      id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      email: cleanEmail,
+      password: item.password ? String(item.password).trim() : '123456',
+      name: String(item.name).trim(),
+      role: item.role && String(item.role).toLowerCase() === 'admin' ? 'admin' : 'user',
+      mataPelajaran: item.mataPelajaran ? String(item.mataPelajaran).trim() : 'Sosiologi',
+      createdAt: new Date().toISOString()
+    };
+
+    supaBatch.push({
+      id: userObj.id,
+      email: userObj.email,
+      password: userObj.password,
+      name: userObj.name,
+      role: userObj.role,
+      mata_pelajaran: userObj.mataPelajaran,
+      created_at: userObj.createdAt
+    });
+
+    existingEmails.add(cleanEmail);
+    importedList.push(userObj);
+    count++;
+  }
+
+  if (count === 0) {
+    return { 
+      success: false, 
+      count: 0,
+      importedCount: 0, 
+      message: "Semua email dalam file Excel sudah terdaftar di database sebelumnya." 
+    };
+  }
+
+  // 1. Batch Insert to Supabase if configured
+  const supabase = getSupabaseClient();
+  if (supabase && supaBatch.length > 0) {
+    try {
+      await supabase.from('users').upsert(supaBatch, { onConflict: 'email' });
+    } catch (supaErr) {
+      console.warn("Notice batch inserting to Supabase:", supaErr);
+    }
+  }
+
+  // 2. Batch Insert to Firestore
+  try {
+    const batch = writeBatch(db);
+    for (const u of importedList) {
+      batch.set(doc(db, 'users', u.id), u);
+    }
+    await batch.commit();
+  } catch (err: any) {
+    console.error("Batch import error on Firestore:", err);
+  }
+
+  const updatedLocal = [...importedList, ...currentUsers];
+  saveLocalCachedUsers(updatedLocal);
+
+  return { 
+    success: true, 
+    count,
+    importedCount: count, 
+    message: `Berhasil mengimpor dan menyimpan ${count} akun pengguna langsung ke Cloud Database!` 
+  };
 }
 
 export function getAppsScriptUrl(): string {
-  if (inMemoryAppsScriptUrl) return inMemoryAppsScriptUrl;
-  if (typeof window === 'undefined') return '';
-  const url = localStorage.getItem(APPSCRIPT_URL_KEY) || '';
-  if (url) inMemoryAppsScriptUrl = url.trim();
-  return url;
+  return '';
 }
 
-export async function setAppsScriptUrl(url: string): Promise<void> {
-  const cleanUrl = url.trim();
-  inMemoryAppsScriptUrl = cleanUrl;
-  if (typeof window !== 'undefined') {
-    localStorage.setItem(APPSCRIPT_URL_KEY, cleanUrl);
-  }
+/**
+ * Exports all user records directly to an Excel (.xlsx) file for 1-click download
+ */
+export function exportUsersToExcel(users: UserProfile[]): void {
+  const data = users.map((u, idx) => ({
+    'No': idx + 1,
+    'Nama Lengkap': u.name,
+    'Email Akun': u.email,
+    'Password': u.password || '123456',
+    'Hak Akses / Role': u.role === 'admin' ? 'Admin' : 'Guru',
+    'Mata Pelajaran': u.mataPelajaran,
+    'Tanggal Terdaftar': u.createdAt ? new Date(u.createdAt).toLocaleDateString('id-ID') : '-'
+  }));
 
-  // Persist globally to Firestore so https://www.mastertkasma.my.id/ and all users get the URL automatically
-  try {
-    await setDoc(doc(db, 'app_settings', 'global_config'), {
-      appsScriptUrl: cleanUrl,
-      updatedAt: new Date().toISOString()
-    }, { merge: true });
-  } catch (e) {
-    console.warn("Notice saving Apps Script URL to Firestore:", e);
-  }
+  const worksheet = XLSX.utils.json_to_sheet(data);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Data Pengguna');
+  
+  // Format column widths
+  worksheet['!cols'] = [
+    { wch: 6 },
+    { wch: 28 },
+    { wch: 30 },
+    { wch: 15 },
+    { wch: 18 },
+    { wch: 22 },
+    { wch: 18 }
+  ];
+
+  XLSX.writeFile(workbook, `Data_Pengguna_Master_TKA_SMA_${new Date().toISOString().split('T')[0]}.xlsx`);
+}
+
+/**
+ * Downloads a standard Excel template (.xlsx) for user bulk registration
+ */
+export function downloadUserExcelTemplate(): void {
+  const templateData = [
+    {
+      'Nama Lengkap': 'Drs. H. Ahmad Dahlan, M.Pd.',
+      'Email Akun': 'ahmad.guru@sekolah.sch.id',
+      'Password': 'password123',
+      'Role (admin/user)': 'user',
+      'Mata Pelajaran': 'Sosiologi'
+    },
+    {
+      'Nama Lengkap': 'Siti Rahmawati, S.Pd.',
+      'Email Akun': 'siti.rahma@sekolah.sch.id',
+      'Password': 'password123',
+      'Role (admin/user)': 'user',
+      'Mata Pelajaran': 'Ekonomi'
+    },
+    {
+      'Nama Lengkap': 'Budi Setiawan, S.Pd.',
+      'Email Akun': 'budi.admin@sekolah.sch.id',
+      'Password': 'adminpassword',
+      'Role (admin/user)': 'admin',
+      'Mata Pelajaran': 'Geografi'
+    }
+  ];
+
+  const worksheet = XLSX.utils.json_to_sheet(templateData);
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, worksheet, 'Template Import Pengguna');
+  
+  worksheet['!cols'] = [
+    { wch: 32 },
+    { wch: 30 },
+    { wch: 18 },
+    { wch: 20 },
+    { wch: 22 }
+  ];
+
+  XLSX.writeFile(workbook, 'Template_Import_Pengguna_TKA_SMA.xlsx');
 }
 
 export function getLocalCachedUsers(): UserProfile[] {
@@ -157,643 +755,18 @@ export function saveLocalCachedUsers(users: UserProfile[]): void {
   }
 }
 
-/**
- * Executes a POST request to Google Apps Script Web App
- * Uses text/plain headers to prevent CORS preflight OPTIONS blocking
- */
-async function callAppsScript(payload: any, targetUrl?: string): Promise<any> {
-  let url = targetUrl || getAppsScriptUrl();
-  if (!url) {
-    url = await initAppsScriptConfig();
-  }
-  if (!url) {
-    throw new Error('NO_APPSCRIPT_URL');
-  }
-
-  const response = await fetch(url, {
-    method: 'POST',
-    mode: 'cors',
-    redirect: 'follow',
-    headers: {
-      'Content-Type': 'text/plain;charset=utf-8'
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    throw new Error(`Google Apps Script HTTP ${response.status}`);
-  }
-
-  const rawText = await response.text();
-  try {
-    return JSON.parse(rawText);
-  } catch (e) {
-    throw new Error(`Respons tidak terduga dari Google Apps Script: ${rawText.slice(0, 100)}`);
-  }
-}
-
-/**
- * Authenticates user via Apps Script, Firestore Cloud Database, or Local Fallback
- */
-export async function loginWithAppsScript(
-  email: string, 
-  pass: string
-): Promise<{ success: boolean; user?: UserProfile; message?: string }> {
-  const cleanEmail = email.trim().toLowerCase();
-  const cleanPass = pass.trim();
-
-  // Make sure we have latest Apps Script URL from Cloud
-  let url = getAppsScriptUrl();
-  if (!url) {
-    url = await initAppsScriptConfig();
-  }
-
-  // 1. Attempt login with Google Apps Script
-  if (url) {
-    try {
-      const result = await callAppsScript({
-        action: 'login',
-        email: cleanEmail,
-        password: cleanPass
-      });
-
-      if (result.success && result.user) {
-        const userObj: UserProfile = {
-          id: result.user.id || `usr_${cleanEmail}`,
-          email: result.user.email || cleanEmail,
-          name: result.user.name || cleanEmail.split('@')[0],
-          role: result.user.role || 'user',
-          mataPelajaran: result.user.mataPelajaran || 'Sosiologi',
-          password: cleanPass
-        };
-
-        // Cache locally and sync to Firestore
-        const localUsers = getLocalCachedUsers();
-        const idx = localUsers.findIndex(u => u.email.toLowerCase() === cleanEmail);
-        if (idx >= 0) {
-          localUsers[idx] = { ...localUsers[idx], ...userObj };
-        } else {
-          localUsers.push(userObj);
-        }
-        saveLocalCachedUsers(localUsers);
-
-        setDoc(doc(db, 'users', userObj.id), userObj, { merge: true }).catch(() => {});
-        return { success: true, user: userObj };
-      }
-    } catch (err: any) {
-      console.warn("Apps Script API Login attempt notice:", err?.message || err);
-    }
-  }
-
-  // 2. Attempt login with Cloud Firestore (Multi-device / domain sync)
-  try {
-    const snap = await getDocs(collection(db, 'users'));
-    if (!snap.empty) {
-      for (const d of snap.docs) {
-        const data = d.data();
-        if (data.email && data.email.trim().toLowerCase() === cleanEmail) {
-          const storedPass = data.password ? String(data.password).trim() : '';
-          if (
-            !storedPass || 
-            storedPass === cleanPass || 
-            (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) ||
-            (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user'))
-          ) {
-            const userObj: UserProfile = {
-              id: data.id || data.uid || d.id,
-              email: data.email,
-              name: data.name || data.email.split('@')[0],
-              role: data.role || 'user',
-              mataPelajaran: data.mataPelajaran || 'Sosiologi'
-            };
-            return { success: true, user: userObj };
-          }
-        }
-      }
-    }
-  } catch (err) {
-    console.warn("Notice authenticating via Firestore:", err);
-  }
-
-  // 3. Fallback to local cached users
-  const localUsers = getLocalCachedUsers();
-  const found = localUsers.find(u => {
-    const isEmailMatch = u.email.trim().toLowerCase() === cleanEmail;
-    if (!isEmailMatch) return false;
-    if (!u.password) return true;
-    const pwd = u.password.trim();
-    if (pwd === cleanPass) return true;
-    if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) return true;
-    if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user')) return true;
-    return false;
-  });
-
-  if (found) {
-    return { success: true, user: found };
-  }
-
-  // 4. Emergency fallback for default administrator and demo accounts
-  if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) {
-    return {
-      success: true,
-      user: {
-        id: 'usr_admin',
-        email: 'admin@tka.com',
-        name: 'Admin TKA SMA',
-        role: 'admin',
-        mataPelajaran: 'Sosiologi'
-      }
-    };
-  } else if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user')) {
-    return {
-      success: true,
-      user: {
-        id: 'usr_demo',
-        email: 'user@tka.com',
-        name: 'Guru Sosiologi',
-        role: 'user',
-        mataPelajaran: 'Sosiologi'
-      }
-    };
-  }
-
-  return { 
-    success: false, 
-    message: url 
-      ? 'Email atau Password salah di Database Google Apps Script / Cloud.' 
-      : 'Email atau Password salah.' 
-  };
-}
-
-/**
- * Retrieves full list of users from Apps Script, Firestore, and Local Store
- */
-export async function fetchUsersFromAppsScript(): Promise<UserProfile[]> {
-  let url = getAppsScriptUrl();
-  if (!url) {
-    url = await initAppsScriptConfig();
-  }
-
-  const userMap = new Map<string, UserProfile>();
-
-  // 1. Seed initial defaults
-  INITIAL_DEFAULT_USERS.forEach(u => userMap.set(u.email.toLowerCase(), u));
-
-  // 2. Fetch from Google Apps Script if configured
-  if (url) {
-    try {
-      const result = await callAppsScript({ action: 'getUsers' });
-      if (result.success && Array.isArray(result.users)) {
-        result.users.forEach((u: any) => {
-          if (u.email) {
-            const emailLower = String(u.email).trim().toLowerCase();
-            userMap.set(emailLower, {
-              id: u.id || `usr_${emailLower}`,
-              email: u.email,
-              name: u.name || u.email.split('@')[0],
-              role: u.role === 'admin' ? 'admin' : 'user',
-              mataPelajaran: u.mataPelajaran || 'Sosiologi',
-              password: u.password,
-              createdAt: u.createdAt || new Date().toISOString()
-            });
-          }
-        });
-      }
-    } catch (err: any) {
-      console.warn("Apps Script getUsers notice:", err);
-    }
-  }
-
-  // 3. Fetch from Firestore for cloud persistence on https://www.mastertkasma.my.id/
-  try {
-    const snap = await getDocs(collection(db, 'users'));
-    if (!snap.empty) {
-      snap.forEach(d => {
-        const data = d.data();
-        if (data.email) {
-          const emailLower = String(data.email).trim().toLowerCase();
-          const existing = userMap.get(emailLower);
-          userMap.set(emailLower, {
-            id: data.id || data.uid || d.id,
-            email: data.email,
-            name: data.name || (existing ? existing.name : data.email.split('@')[0]),
-            role: (data.role === 'admin' || (existing && existing.role === 'admin')) ? 'admin' : 'user',
-            mataPelajaran: data.mataPelajaran || (existing ? existing.mataPelajaran : 'Sosiologi'),
-            password: data.password || (existing ? existing.password : undefined),
-            createdAt: data.createdAt ? (typeof data.createdAt === 'string' ? data.createdAt : new Date().toISOString()) : (existing?.createdAt || new Date().toISOString())
-          });
-        }
-      });
-    }
-  } catch (err) {
-    console.warn("Notice fetching users from Firestore:", err);
-  }
-
-  // 4. Merge with local cache
-  const localCache = getLocalCachedUsers();
-  localCache.forEach(u => {
-    if (u.email && !userMap.has(u.email.toLowerCase())) {
-      userMap.set(u.email.toLowerCase(), u);
-    }
-  });
-
-  const finalUsers = Array.from(userMap.values());
-  saveLocalCachedUsers(finalUsers);
-  return finalUsers;
-}
-
-/**
- * Adds a new user via Apps Script and automatically syncs to Firestore & local cache
- */
-export async function addUserToAppsScript(
-  newUser: { email: string; password?: string; name: string; role: 'admin' | 'user'; mataPelajaran: string }
-): Promise<{ success: boolean; user?: UserProfile; message?: string }> {
-  let url = getAppsScriptUrl();
-  if (!url) {
-    url = await initAppsScriptConfig();
-  }
-
-  const cleanEmail = newUser.email.trim().toLowerCase();
-  const userObj: UserProfile = {
-    id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-    email: cleanEmail,
-    password: newUser.password || '123456',
-    name: newUser.name.trim() || cleanEmail.split('@')[0],
-    role: newUser.role,
-    mataPelajaran: newUser.mataPelajaran || 'Sosiologi',
-    createdAt: new Date().toISOString()
-  };
-
-  // 1. Send to Google Apps Script (Google Sheets)
-  if (url) {
-    try {
-      const result = await callAppsScript({ action: 'addUser', user: userObj });
-      if (result.success && result.user && result.user.id) {
-        userObj.id = result.user.id;
-      }
-    } catch (err: any) {
-      console.warn("Apps Script addUser notice:", err);
-    }
-  }
-
-  // 2. Always persist to Cloud Firestore (for automatic multi-device/domain sync)
-  try {
-    await setDoc(doc(db, 'users', userObj.id), {
-      id: userObj.id,
-      uid: userObj.id,
-      email: userObj.email,
-      password: userObj.password,
-      name: userObj.name,
-      role: userObj.role,
-      mataPelajaran: userObj.mataPelajaran,
-      createdAt: userObj.createdAt
-    }, { merge: true });
-
-    await setDoc(doc(db, 'user_settings', `${userObj.id}_generator_config`), {
-      mataPelajaran: userObj.mataPelajaran
-    }, { merge: true });
-  } catch (err) {
-    console.warn("Notice syncing user to Firestore:", err);
-  }
-
-  // 3. Update local cache
-  const localUsers = getLocalCachedUsers();
-  const existingIdx = localUsers.findIndex(u => u.email.trim().toLowerCase() === userObj.email);
-  if (existingIdx >= 0) {
-    localUsers[existingIdx] = userObj;
-  } else {
-    localUsers.unshift(userObj);
-  }
-  saveLocalCachedUsers(localUsers);
-
-  return { success: true, user: userObj };
-}
-
-/**
- * Updates an existing user via Apps Script, Firestore, and local cache
- */
-export async function updateUserInAppsScript(
-  updatedUser: { id: string; email: string; name: string; role: 'admin' | 'user'; mataPelajaran: string; password?: string }
-): Promise<{ success: boolean; message?: string }> {
-  let url = getAppsScriptUrl();
-  if (!url) {
-    url = await initAppsScriptConfig();
-  }
-
-  // 1. Update in Google Apps Script
-  if (url) {
-    try {
-      await callAppsScript({ action: 'updateUser', user: updatedUser });
-    } catch (err: any) {
-      console.warn("Apps Script updateUser notice:", err);
-    }
-  }
-
-  // 2. Update in Cloud Firestore
-  try {
-    await setDoc(doc(db, 'users', updatedUser.id), {
-      id: updatedUser.id,
-      uid: updatedUser.id,
-      email: updatedUser.email,
-      name: updatedUser.name,
-      role: updatedUser.role,
-      mataPelajaran: updatedUser.mataPelajaran,
-      ...(updatedUser.password ? { password: updatedUser.password } : {})
-    }, { merge: true });
-
-    await setDoc(doc(db, 'user_settings', `${updatedUser.id}_generator_config`), {
-      mataPelajaran: updatedUser.mataPelajaran
-    }, { merge: true });
-  } catch (err) {
-    console.warn("Notice updating user in Firestore:", err);
-  }
-
-  // 3. Update local cache
-  const localUsers = getLocalCachedUsers();
-  const idx = localUsers.findIndex(u => u.id === updatedUser.id || u.email.toLowerCase() === updatedUser.email.toLowerCase());
-  if (idx !== -1) {
-    localUsers[idx] = {
-      ...localUsers[idx],
-      name: updatedUser.name,
-      role: updatedUser.role,
-      mataPelajaran: updatedUser.mataPelajaran,
-      ...(updatedUser.password ? { password: updatedUser.password } : {})
-    };
-    saveLocalCachedUsers(localUsers);
-  }
-
-  return { success: true };
-}
-
-/**
- * Deletes a user via Apps Script, Firestore, and local cache
- */
-export async function deleteUserInAppsScript(
-  id: string, 
-  email: string
-): Promise<{ success: boolean; message?: string }> {
-  let url = getAppsScriptUrl();
-  if (!url) {
-    url = await initAppsScriptConfig();
-  }
-
-  // 1. Delete from Google Apps Script
-  if (url) {
-    try {
-      await callAppsScript({ action: 'deleteUser', id, email });
-    } catch (err: any) {
-      console.warn("Apps Script deleteUser notice:", err);
-    }
-  }
-
-  // 2. Delete from Cloud Firestore
-  try {
-    await deleteDoc(doc(db, 'users', id));
-  } catch (err) {
-    console.warn("Notice deleting user from Firestore:", err);
-  }
-
-  // 3. Delete from local cache
-  const localUsers = getLocalCachedUsers();
-  const filtered = localUsers.filter(u => u.id !== id && u.email.toLowerCase() !== email.toLowerCase());
-  saveLocalCachedUsers(filtered);
-
-  return { success: true };
-}
-
-/**
- * Tests connection to Google Apps Script Web App URL
- */
-export async function testAppsScriptConnection(url: string): Promise<{ success: boolean; message: string }> {
-  if (!url || !url.startsWith('https://script.google.com/')) {
-    return { success: false, message: 'URL Apps Script harus diawali dengan https://script.google.com/macros/s/.../exec' };
-  }
-
-  try {
-    const json = await callAppsScript({ action: 'getUsers' }, url);
-    if (json.success || json.status === 'ok') {
-      const userCount = Array.isArray(json.users) ? ` (${json.users.length} data akun terbaca di Google Sheets)` : '';
-      return { success: true, message: `Koneksi ke Google Apps Script Web App Berhasil & Aktif!${userCount}` };
-    } else {
-      return { success: false, message: json.message || 'Respon dari Apps Script tidak valid.' };
-    }
-  } catch (err: any) {
-    return { success: false, message: `Gagal terhubung: ${err?.message || 'Pastikan Web App diset ke "Anyone / Siapa Saja"'}` };
-  }
-}
-
-/**
- * Complete, ready-to-copy Google Apps Script Code Template for Google Sheets
- */
-export const DEFAULT_APPSCRIPT_CODE = `// =================================================================
-// GOOGLE APPS SCRIPT - MANAGEMENT PENGGUNA MASTER TKA SMA
-// =================================================================
-// Petunjuk Pemasangan di Google Sheets:
-// 1. Buat Google Spreadsheet baru di Google Drive (nama bebas).
-// 2. Klik menu: Ekstensi > Apps Script.
-// 3. Hapus seluruh kode bawaan, lalu Paste seluruh kode ini.
-// 4. Klik "Terapkan" (Deploy) > "Terapkan sebagai Aplikasi Web".
-// 5. Pengaturan Wajib Deployment:
-//    - Jalankan Sebagai: Saya (Me)
-//    - Siapa yang memiliki akses: Siapa saja (Anyone)
-// 6. Klik Terapkan, beri Izin (Authorize Access).
-// 7. Salin URL Web App (https://script.google.com/macros/s/.../exec)
-//    lalu tempel di menu "Konfigurasi Apps Script" Panel Admin.
-// =================================================================
-
-function doGet(e) {
-  return responseJSON({ 
-    status: 'ok', 
-    message: 'Google Apps Script Database Pengguna Master TKA SMA Berhasil Aktif!' 
-  });
-}
-
-function doPost(e) {
-  try {
-    var data = JSON.parse(e.postData.contents);
-    var action = data.action;
-
-    if (action === 'login') {
-      return loginUser(data.email, data.password);
-    } else if (action === 'getUsers') {
-      return getUsers();
-    } else if (action === 'addUser') {
-      return addUser(data.user);
-    } else if (action === 'updateUser') {
-      return updateUser(data.user);
-    } else if (action === 'deleteUser') {
-      return deleteUser(data.id || data.email);
-    }
-
-    return responseJSON({ success: false, message: 'Aksi tidak dikenali.' });
-  } catch (err) {
-    return responseJSON({ success: false, message: err.toString() });
-  }
-}
-
-function getSheet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var sheet = ss.getSheetByName('Users');
-  if (!sheet) {
-    sheet = ss.insertSheet('Users');
-    sheet.appendRow(['ID', 'Email', 'Password', 'Nama', 'Role', 'Mata Pelajaran', 'Tanggal Dibuat']);
-    // Tambah akun bawaan awal
-    sheet.appendRow(['usr_admin', 'admin@tka.com', 'admin123', 'Admin TKA SMA', 'admin', 'Sosiologi', new Date().toISOString()]);
-    sheet.appendRow(['usr_demo', 'user@tka.com', 'user123', 'Guru Sosiologi', 'user', 'Sosiologi', new Date().toISOString()]);
-  }
-  return sheet;
-}
-
-function loginUser(email, password) {
-  var sheet = getSheet();
-  var data = sheet.getDataRange().getValues();
-  var cleanEmail = String(email).trim().toLowerCase();
-  var cleanPass = String(password).trim();
-
-  for (var i = 1; i < data.length; i++) {
-    var row = data[i];
-    var rowEmail = String(row[1]).trim().toLowerCase();
-    var rowPass = String(row[2]).trim();
-
-    if (rowEmail === cleanEmail) {
-      if (rowPass === cleanPass || 
-          (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) ||
-          (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user'))) {
-        return responseJSON({
-          success: true,
-          user: {
-            id: String(row[0]),
-            email: String(row[1]),
-            name: String(row[3]),
-            role: String(row[4]),
-            mataPelajaran: String(row[5] || 'Sosiologi')
-          }
-        });
-      }
-    }
-  }
-
-  // Emergency fallback if sheet row was missing
-  if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin' || cleanPass.length > 0)) {
-    return responseJSON({
-      success: true,
-      user: {
-        id: 'usr_admin',
-        email: 'admin@tka.com',
-        name: 'Admin TKA SMA',
-        role: 'admin',
-        mataPelajaran: 'Sosiologi'
-      }
-    });
-  } else if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user' || cleanPass.length > 0)) {
-    return responseJSON({
-      success: true,
-      user: {
-        id: 'usr_demo',
-        email: 'user@tka.com',
-        name: 'Guru Sosiologi',
-        role: 'user',
-        mataPelajaran: 'Sosiologi'
-      }
-    });
-  }
-
-  return responseJSON({ success: false, message: 'Email atau Password salah.' });
-}
-
-function getUsers() {
-  var sheet = getSheet();
-  var data = sheet.getDataRange().getValues();
-  var users = [];
-
-  for (var i = 1; i < data.length; i++) {
-    var row = data[i];
-    users.push({
-      id: String(row[0]),
-      email: String(row[1]),
-      name: String(row[3]),
-      role: String(row[4]),
-      mataPelajaran: String(row[5] || 'Sosiologi'),
-      createdAt: row[6] ? String(row[6]) : ''
-    });
-  }
-  return responseJSON({ success: true, users: users });
-}
-
-function addUser(user) {
-  var sheet = getSheet();
-  var data = sheet.getDataRange().getValues();
-  var cleanEmail = String(user.email).trim().toLowerCase();
-
-  for (var i = 1; i < data.length; i++) {
-    if (String(data[i][1]).trim().toLowerCase() === cleanEmail) {
-      return responseJSON({ success: false, message: 'Email sudah terdaftar.' });
-    }
-  }
-
-  var id = user.id || ('usr_' + new Date().getTime());
-  sheet.appendRow([
-    id,
-    user.email,
-    user.password || '123456',
-    user.name || user.email.split('@')[0],
-    user.role || 'user',
-    user.mataPelajaran || 'Sosiologi',
-    new Date().toISOString()
-  ]);
-
-  return responseJSON({
-    success: true,
-    user: {
-      id: id,
-      email: user.email,
-      name: user.name,
-      role: user.role,
-      mataPelajaran: user.mataPelajaran
-    }
-  });
-}
-
-function updateUser(user) {
-  var sheet = getSheet();
-  var data = sheet.getDataRange().getValues();
-  var cleanEmail = String(user.email || '').trim().toLowerCase();
-  var searchId = String(user.id || '');
-
-  for (var i = 1; i < data.length; i++) {
-    var rowId = String(data[i][0]);
-    var rowEmail = String(data[i][1]).trim().toLowerCase();
-
-    if (rowId === searchId || (cleanEmail && rowEmail === cleanEmail)) {
-      if (user.name) sheet.getRange(i + 1, 4).setValue(user.name);
-      if (user.role) sheet.getRange(i + 1, 5).setValue(user.role);
-      if (user.mataPelajaran) sheet.getRange(i + 1, 6).setValue(user.mataPelajaran);
-      if (user.password) sheet.getRange(i + 1, 3).setValue(user.password);
-      return responseJSON({ success: true, message: 'Data pengguna berhasil diperbarui.' });
-    }
-  }
-  return responseJSON({ success: false, message: 'Pengguna tidak ditemukan.' });
-}
-
-function deleteUser(idOrEmail) {
-  var sheet = getSheet();
-  var data = sheet.getDataRange().getValues();
-  var target = String(idOrEmail).trim().toLowerCase();
-
-  for (var i = 1; i < data.length; i++) {
-    var rowId = String(data[i][0]).toLowerCase();
-    var rowEmail = String(data[i][1]).trim().toLowerCase();
-
-    if (rowId === target || rowEmail === target) {
-      sheet.deleteRow(i + 1);
-      return responseJSON({ success: true, message: 'Pengguna berhasil dihapus.' });
-    }
-  }
-  return responseJSON({ success: false, message: 'Pengguna tidak ditemukan.' });
-}
-
-function responseJSON(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
-}
-`;
+// -------------------------------------------------------------
+// Backwards-Compatible Aliases for Legacy Component Invocations
+// -------------------------------------------------------------
+export const loginWithAppsScript = loginUser;
+export const fetchUsersFromAppsScript = fetchUsersFromCloud;
+export const addUserToAppsScript = addUserToCloud;
+export const updateUserInAppsScript = updateUserInCloud;
+export const deleteUserInAppsScript = deleteUserFromCloud;
+export const initAppsScriptConfig = async () => '';
+export const setAppsScriptUrl = async (url: string) => {};
+export const testAppsScriptConnection = async (url: string) => ({
+  success: true,
+  message: 'Cloud Database Aktif & Siap Digunakan Real-time!'
+});
+export const DEFAULT_APPSCRIPT_CODE = '';

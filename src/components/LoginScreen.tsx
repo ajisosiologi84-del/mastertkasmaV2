@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { motion } from 'motion/react';
-import { loginWithAppsScript, initAppsScriptConfig } from '../lib/userManagement';
+import { loginUser } from '../lib/userManagement';
 import { 
   Lock, 
   Mail, 
@@ -26,10 +26,6 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
-  useEffect(() => {
-    initAppsScriptConfig().catch(() => {});
-  }, []);
-
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!email || !password) {
@@ -40,7 +36,7 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
     setError(null);
 
     try {
-      const res = await loginWithAppsScript(email, password);
+      const res = await loginUser(email, password);
       if (res.success && res.user) {
         onLoginSuccess(res.user.role, res.user.name, res.user);
       } else {

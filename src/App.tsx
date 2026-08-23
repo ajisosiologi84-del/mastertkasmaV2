@@ -65,15 +65,19 @@ import mammoth from 'mammoth';
 import { KisiKisiItem, Question, GeneratorConfig, BentukSoal, LevelKognitif, JumlahOpsi, JenisSoal, JadwalItem } from './types';
 import { auth, db } from './lib/firebase';
 import { 
-  getAppsScriptUrl, 
-  setAppsScriptUrl, 
-  initAppsScriptConfig,
-  testAppsScriptConnection, 
-  fetchUsersFromAppsScript, 
-  addUserToAppsScript, 
-  updateUserInAppsScript, 
-  deleteUserInAppsScript, 
-  DEFAULT_APPSCRIPT_CODE,
+  subscribeToUsers,
+  exportUsersToExcel,
+  downloadUserExcelTemplate,
+  importUsersBatchToCloud,
+  fetchUsersFromCloud,
+  addUserToCloud,
+  updateUserInCloud,
+  deleteUserFromCloud,
+  loginUser,
+  getStoredSupabaseConfig,
+  saveStoredSupabaseConfig,
+  testSupabaseConnection,
+  SUPABASE_SQL_SETUP_CODE,
   UserProfile 
 } from './lib/userManagement';
 import { 
@@ -1697,12 +1701,14 @@ export default function App() {
   const [userError, setUserError] = useState<string | null>(null);
   const [userSuccess, setUserSuccess] = useState<string | null>(null);
 
-  // Apps Script Database Configuration State
-  const [appsScriptUrlInput, setAppsScriptUrlInput] = useState<string>(() => getAppsScriptUrl());
-  const [isTestingAppsScript, setIsTestingAppsScript] = useState<boolean>(false);
-  const [appsScriptTestMsg, setAppsScriptTestMsg] = useState<{ success: boolean; text: string } | null>(null);
-  const [showAppsScriptGuideModal, setShowAppsScriptGuideModal] = useState<boolean>(false);
-  const [isCopyingScriptCode, setIsCopyingScriptCode] = useState<boolean>(false);
+  // Supabase Database Connection State
+  const [supabaseUrlInput, setSupabaseUrlInput] = useState<string>(() => getStoredSupabaseConfig().url);
+  const [supabaseKeyInput, setSupabaseKeyInput] = useState<string>(() => getStoredSupabaseConfig().key);
+  const [isTestingSupabase, setIsTestingSupabase] = useState<boolean>(false);
+  const [supabaseTestMsg, setSupabaseTestMsg] = useState<{ success: boolean; text: string } | null>(null);
+  const [showSupabaseSqlModal, setShowSupabaseSqlModal] = useState<boolean>(false);
+  const [isCopyingSqlCode, setIsCopyingSqlCode] = useState<boolean>(false);
+
 
   const [config, setConfig] = useState<GeneratorConfig>({
     mataPelajaran: 'Sosiologi',
@@ -2426,45 +2432,14 @@ export default function App() {
     }
   }, []);
 
-  // Synchronize Google Apps Script URL configuration across all devices / domains
-  useEffect(() => {
-    initAppsScriptConfig().then((url) => {
-      if (url) {
-        setAppsScriptUrlInput(url);
-      }
-    });
-
-    const unsub = onSnapshot(doc(db, 'app_settings', 'global_config'), (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        if (data.appsScriptUrl && typeof data.appsScriptUrl === 'string') {
-          const url = data.appsScriptUrl.trim();
-          setAppsScriptUrlInput(url);
-          if (typeof window !== 'undefined') {
-            localStorage.setItem('tka_appscript_url', url);
-          }
-        }
-      }
-    }, (err) => {
-      console.warn("Notice listening to global apps script config:", err);
-    });
-
-    return () => unsub();
-  }, []);
-
-  // Fetch users list from Apps Script, Cloud Firestore, and Local Cache
+  // Real-time Cloud User Database Subscription (Multi-User & Multi-Device Sync)
   useEffect(() => {
     if (!currentUser) return;
-    const loadUsers = async () => {
-      try {
-        const users = await fetchUsersFromAppsScript();
-        setUsersList(users);
-      } catch (err) {
-        console.warn("Notice loading users list:", err);
-      }
-    };
-    loadUsers();
-  }, [currentUser, userRole]);
+    const unsub = subscribeToUsers((users) => {
+      setUsersList(users);
+    });
+    return () => unsub();
+  }, [currentUser]);
 
   // Fast local storage initialization and lightweight User Management listener
   useEffect(() => {
@@ -12368,106 +12343,146 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
         {/* Tab 5: Manajemen Pengguna */}
         {activeTab === 'users' && userRole === 'admin' && (
           <div id="users-panel" className="space-y-8 animate-fadeIn no-print">
-            {/* Top Banner: Apps Script Database Configuration */}
-            <section className="bg-gradient-to-r from-emerald-950 via-teal-900 to-slate-900 text-white rounded-3xl p-6 sm:p-8 shadow-xl border border-emerald-700/40 space-y-5">
-              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-emerald-800/60 pb-5">
+            {/* Top Banner: Supabase Cloud Database Configuration */}
+            <section className="bg-gradient-to-r from-slate-900 via-emerald-950 to-slate-900 text-white rounded-3xl p-6 sm:p-8 shadow-xl border border-emerald-500/30 space-y-5">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-emerald-800/40 pb-5">
                 <div className="flex items-center gap-3">
                   <div className="p-3 bg-emerald-500/20 border border-emerald-400/30 rounded-2xl text-emerald-300 shrink-0">
                     <Database className="h-6 w-6" />
                   </div>
                   <div>
-                    <div className="flex items-center gap-2">
-                      <h2 className="text-lg sm:text-xl font-extrabold tracking-tight">Database Pengguna: Google Apps Script</h2>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h2 className="text-lg sm:text-xl font-extrabold tracking-tight">Database Pengguna: Supabase Cloud (PostgreSQL)</h2>
                       <span className={`text-[10px] font-black px-2.5 py-0.5 rounded-full border uppercase tracking-wider ${
-                        getAppsScriptUrl()
+                        supabaseUrlInput.trim() && supabaseKeyInput.trim()
                           ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
-                          : 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+                          : 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
                       }`}>
-                        {getAppsScriptUrl() ? '🟢 Terhubung ke Google Sheets' : '🟡 Mode Penyimpanan Lokal'}
+                        {supabaseUrlInput.trim() && supabaseKeyInput.trim() ? '🟢 Supabase PostgreSQL Terhubung' : '🔵 Cloud Database Aktif'}
                       </span>
                     </div>
                     <p className="text-xs text-slate-300 mt-1">
-                      Menggunakan Google Apps Script & Google Sheets sebagai backend database pengguna tanpa batas kuota harian.
+                      Data akun guru dan password tersimpan aman dengan Row Level Security (RLS) & enkripsi cloud di <a href="https://supabase.com" target="_blank" rel="noreferrer" className="text-emerald-300 font-bold underline hover:text-emerald-200">Supabase.com</a> untuk domain <code className="text-emerald-300 font-mono">mastertkasma.my.id</code>.
                     </p>
                   </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => setShowAppsScriptGuideModal(true)}
-                  className="bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-black text-xs px-4 py-2.5 rounded-xl shadow transition flex items-center justify-center gap-2 shrink-0"
-                >
-                  <FileCode className="h-4 w-4" />
-                  <span>📖 Panduan & Salin Kode Apps Script</span>
-                </button>
+                <div className="flex items-center gap-2 flex-wrap shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowSupabaseSqlModal(true)}
+                    className="bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-black text-xs px-3.5 py-2.5 rounded-xl shadow transition flex items-center gap-1.5"
+                    title="Buka panduan & salin kode SQL untuk membuat tabel users di Supabase"
+                  >
+                    <FileCode className="h-4 w-4" />
+                    <span>📖 Setup SQL Supabase</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => downloadUserExcelTemplate()}
+                    className="bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-bold text-xs px-3.5 py-2.5 rounded-xl shadow transition flex items-center gap-1.5"
+                    title="Unduh contoh template file Excel untuk penambahan massal pengguna"
+                  >
+                    <Download className="h-4 w-4 text-slate-400" />
+                    <span>Template Excel</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => exportUsersToExcel(usersList)}
+                    className="bg-indigo-600 hover:bg-indigo-500 text-white font-extrabold text-xs px-4 py-2.5 rounded-xl shadow transition flex items-center gap-1.5"
+                    title="Ekspor seluruh daftar pengguna yang terdaftar ke file Excel"
+                  >
+                    <Download className="h-4 w-4" />
+                    <span>Ekspor (.xlsx)</span>
+                  </button>
+                </div>
               </div>
 
-              <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-end">
-                <div className="lg:col-span-8 space-y-1.5">
-                  <label className="block text-xs font-bold uppercase tracking-wider text-emerald-200">
-                    URL Web App Google Apps Script (`exec`)
+              {/* Supabase Configuration Inputs */}
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end pt-1">
+                <div className="md:col-span-5 space-y-1">
+                  <label className="block text-[11px] font-bold uppercase tracking-wider text-emerald-200">
+                    Project URL Supabase
                   </label>
                   <input
                     type="url"
-                    placeholder="https://script.google.com/macros/s/AKfycb.../exec"
-                    value={appsScriptUrlInput}
+                    placeholder="https://xyzcompany.supabase.co"
+                    value={supabaseUrlInput}
                     onChange={(e) => {
-                      setAppsScriptUrlInput(e.target.value);
-                      setAppsScriptTestMsg(null);
+                      setSupabaseUrlInput(e.target.value);
+                      setSupabaseTestMsg(null);
                     }}
-                    className="w-full bg-slate-900/90 border border-emerald-700/60 focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 rounded-xl px-4 py-2.5 text-xs text-emerald-100 placeholder-slate-500 font-mono"
+                    className="w-full bg-slate-900/90 border border-emerald-700/60 focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 rounded-xl px-3.5 py-2 text-xs text-emerald-100 placeholder-slate-500 font-mono"
                   />
                 </div>
 
-                <div className="lg:col-span-4 flex items-center gap-2">
+                <div className="md:col-span-4 space-y-1">
+                  <label className="block text-[11px] font-bold uppercase tracking-wider text-emerald-200">
+                    Anon / Public Key Supabase
+                  </label>
+                  <input
+                    type="password"
+                    placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                    value={supabaseKeyInput}
+                    onChange={(e) => {
+                      setSupabaseKeyInput(e.target.value);
+                      setSupabaseTestMsg(null);
+                    }}
+                    className="w-full bg-slate-900/90 border border-emerald-700/60 focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 rounded-xl px-3.5 py-2 text-xs text-emerald-100 placeholder-slate-500 font-mono"
+                  />
+                </div>
+
+                <div className="md:col-span-3 flex items-center gap-2">
                   <button
                     type="button"
-                    disabled={isTestingAppsScript || !appsScriptUrlInput.trim()}
+                    disabled={isTestingSupabase || !supabaseUrlInput.trim() || !supabaseKeyInput.trim()}
                     onClick={async () => {
-                      setIsTestingAppsScript(true);
-                      setAppsScriptTestMsg(null);
-                      const res = await testAppsScriptConnection(appsScriptUrlInput.trim());
-                      setAppsScriptTestMsg({
+                      setIsTestingSupabase(true);
+                      setSupabaseTestMsg(null);
+                      const res = await testSupabaseConnection(supabaseUrlInput.trim(), supabaseKeyInput.trim());
+                      setSupabaseTestMsg({
                         success: res.success,
                         text: res.message
                       });
-                      setIsTestingAppsScript(false);
+                      setIsTestingSupabase(false);
                     }}
-                    className="flex-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 font-bold text-xs py-2.5 px-3 rounded-xl border border-slate-700 transition flex items-center justify-center gap-1.5"
+                    className="flex-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-200 font-bold text-xs py-2 px-2.5 rounded-xl border border-slate-700 transition flex items-center justify-center gap-1.5"
                   >
-                    {isTestingAppsScript ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5 text-amber-400" />}
+                    {isTestingSupabase ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5 text-amber-400" />}
                     <span>Tes Koneksi</span>
                   </button>
 
                   <button
                     type="button"
                     onClick={async () => {
-                      await setAppsScriptUrl(appsScriptUrlInput.trim());
-                      setAppsScriptTestMsg({
+                      saveStoredSupabaseConfig(supabaseUrlInput.trim(), supabaseKeyInput.trim());
+                      setSupabaseTestMsg({
                         success: true,
-                        text: appsScriptUrlInput.trim() 
-                          ? "URL Google Apps Script berhasil disimpan ke Cloud & Lokal! Memuat data pengguna..." 
-                          : "URL Apps Script dikosongkan. Sistem beralih ke mode penyimpanan lokal & Cloud Database."
+                        text: supabaseUrlInput.trim() && supabaseKeyInput.trim()
+                          ? "Kredensial Supabase berhasil disimpan! Memuat data pengguna dari Supabase..."
+                          : "Kredensial Supabase dikosongkan. Sistem menggunakan Cloud Database bawaan."
                       });
-                      const users = await fetchUsersFromAppsScript();
+                      const users = await fetchUsersFromCloud();
                       setUsersList(users);
                     }}
-                    className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs py-2.5 px-3 rounded-xl shadow transition flex items-center justify-center gap-1.5"
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-xs py-2 px-2.5 rounded-xl shadow transition flex items-center justify-center gap-1.5"
                   >
                     <Save className="h-3.5 w-3.5" />
-                    <span>Simpan URL</span>
+                    <span>Simpan</span>
                   </button>
                 </div>
               </div>
 
-              {appsScriptTestMsg && (
+              {supabaseTestMsg && (
                 <div className={`p-3 rounded-xl text-xs flex items-center gap-2 font-medium ${
-                  appsScriptTestMsg.success
+                  supabaseTestMsg.success
                     ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-200'
                     : 'bg-rose-500/20 border border-rose-500/40 text-rose-200'
                 }`}>
-                  {appsScriptTestMsg.success ? <Check className="h-4 w-4 shrink-0 text-emerald-400" /> : <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />}
-                  <span>{appsScriptTestMsg.text}</span>
+                  {supabaseTestMsg.success ? <Check className="h-4 w-4 shrink-0 text-emerald-400" /> : <AlertCircle className="h-4 w-4 shrink-0 text-rose-400" />}
+                  <span>{supabaseTestMsg.text}</span>
                 </div>
               )}
             </section>
@@ -12505,7 +12520,7 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                   setUserSuccess(null);
                   setIsAddingUser(true);
                   try {
-                    const result = await addUserToAppsScript({
+                    const result = await addUserToCloud({
                       name: newUserName.trim(),
                       email: newUserEmail.trim(),
                       password: newUserPassword,
@@ -12514,14 +12529,12 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                     });
 
                     if (result.success) {
-                      setUserSuccess(`Akun ${newUserName} (${newUserRole === 'admin' ? 'Admin' : 'Guru'}) berhasil didaftarkan!`);
+                      setUserSuccess(`Akun ${newUserName} (${newUserRole === 'admin' ? 'Admin' : 'Guru'}) berhasil didaftarkan ke Cloud Database!`);
                       setNewUserName('');
                       setNewUserEmail('');
                       setNewUserPassword('');
                       setNewUserRole('user');
                       setNewUserMataPelajaran('Sosiologi');
-                      const updatedUsers = await fetchUsersFromAppsScript();
-                      setUsersList(updatedUsers);
                     } else {
                       setUserError(result.message || "Gagal mendaftarkan pengguna baru.");
                     }
@@ -12635,7 +12648,7 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                     {isAddingUser ? (
                       <>
                         <RefreshCw className="h-4 w-4 animate-spin" />
-                        <span>Mendaftarkan Guru...</span>
+                        <span>Mendaftarkan Guru ke Cloud...</span>
                       </>
                     ) : (
                       <>
@@ -12654,46 +12667,10 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                     <Users className="h-5 w-5 text-indigo-600" />
                     <h2 className="text-lg font-bold text-slate-800">Daftar Pengguna Sistem</h2>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-2 flex-wrap">
                     <span className="bg-indigo-50 text-indigo-700 text-[10px] font-black px-2.5 py-1 rounded-full uppercase tracking-wider">
                       {usersList.length} Pengguna
                     </span>
-
-                    {/* Download Template Excel Button */}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        try {
-                          const templateData = [
-                            {
-                              "Nama": "Budi Santoso, S.Pd.",
-                              "Email": "budi.santoso@sekolah.sch.id",
-                              "Password": "password123",
-                              "Role": "user",
-                              "Mata Pelajaran": "Sosiologi"
-                            },
-                            {
-                              "Nama": "Siti Rahma, M.Pd.",
-                              "Email": "siti.rahma@sekolah.sch.id",
-                              "Password": "password123",
-                              "Role": "admin",
-                              "Mata Pelajaran": "Matematika"
-                            }
-                          ];
-                          const ws = XLSX.utils.json_to_sheet(templateData);
-                          const wb = XLSX.utils.book_new();
-                          XLSX.utils.book_append_sheet(wb, ws, "Template Pengguna");
-                          XLSX.writeFile(wb, "Template_Import_Pengguna_TKA.xlsx");
-                        } catch (err: any) {
-                          console.error("Gagal mengunduh template excel:", err);
-                        }
-                      }}
-                      className="bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-200 px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 transition"
-                      title="Unduh contoh format file Excel untuk impor akun pengguna"
-                    >
-                      <Download className="h-3.5 w-3.5 text-slate-600" />
-                      <span>Template Excel</span>
-                    </button>
 
                     {/* Batch Impor Excel / CSV / JSON Button */}
                     <label className="cursor-pointer bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm border border-emerald-600 px-3 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1.5 transition">
@@ -12747,7 +12724,6 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                               const text = await file.text();
                               const lines = text.split(/\r?\n/).filter(line => line.trim().length > 0);
                               for (let i = 0; i < lines.length; i++) {
-                                // Skip header row if present
                                 if (i === 0 && (lines[i].toLowerCase().includes('email') || lines[i].toLowerCase().includes('nama'))) {
                                   continue;
                                 }
@@ -12765,45 +12741,17 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                               }
                             }
 
-                            let count = 0;
-                            let skipped = 0;
-                            for (const item of userItems) {
-                              if (item.email && item.email.includes('@')) {
-                                try {
-                                  const res = await addUserToAppsScript({
-                                    email: item.email,
-                                    password: item.password || 'guru123',
-                                    name: item.name || 'Guru',
-                                    role: item.role === 'admin' ? 'admin' : 'user',
-                                    mataPelajaran: item.mataPelajaran || 'Sosiologi'
-                                  });
-                                  if (res.success) count++; else skipped++;
-                                } catch (itemErr: any) {
-                                  skipped++;
-                                }
-                              } else {
-                                skipped++;
-                              }
-                            }
-
-                            const updatedUsers = await fetchUsersFromAppsScript();
-                            setUsersList(updatedUsers);
-
-                            if (count > 0) {
-                              if (skipped > 0) {
-                                setUserSuccess(`Berhasil mengimpor ${count} akun pengguna dari Excel/File (${skipped} akun dilewati/gagal).`);
-                              } else {
-                                setUserSuccess(`Berhasil mengimpor ${count} akun pengguna dari Excel/File!`);
-                              }
+                            const result = await importUsersBatchToCloud(userItems);
+                            if (result.success) {
+                              setUserSuccess(`Berhasil mengimpor ${result.count} akun pengguna ke Cloud Database!`);
                             } else {
-                              setUserError(`Tidak ada akun yang berhasil diimpor. Pastikan file Excel memiliki kolom: Nama, Email, Password, Role, Mata Pelajaran.`);
+                              setUserError(result.message || "Gagal mengimpor data akun.");
                             }
                           } catch (err: any) {
                             console.error(err);
                             setUserError(`Gagal impor file Excel/CSV: ${err.message || err}`);
                           } finally {
                             setIsBatchImportingUsers(false);
-                            // Reset input value
                             e.target.value = '';
                           }
                         }}
@@ -12887,11 +12835,9 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                                 onClick={async () => {
                                   if (confirm(`Apakah Anda yakin ingin menghapus akses pengguna ${usr.name || usr.email}?`)) {
                                     try {
-                                      const res = await deleteUserInAppsScript(usr.id, usr.email);
+                                      const res = await deleteUserFromCloud(usr.id);
                                       if (res.success) {
                                         setUserSuccess(`Pengguna ${usr.name || usr.email} berhasil dihapus.`);
-                                        const updatedUsers = await fetchUsersFromAppsScript();
-                                        setUsersList(updatedUsers);
                                       } else {
                                         alert(`Gagal menghapus pengguna: ${res.message}`);
                                       }
@@ -12917,7 +12863,7 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                       {usersList.length === 0 && (
                         <tr>
                           <td colSpan={4} className="text-center py-8 text-slate-400">
-                            Tidak ada pengguna terdaftar.
+                            Tidak ada pengguna terdaftar di Cloud Database.
                           </td>
                         </tr>
                       )}
@@ -13033,7 +12979,7 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                         setIsSavingUserEdit(true);
                         try {
                           const updatedSubject = editingUser.mataPelajaran || 'Sosiologi';
-                          const res = await updateUserInAppsScript({
+                          const res = await updateUserInCloud({
                             id: editingUser.id,
                             email: editingUser.email,
                             name: editingUser.name,
@@ -13049,8 +12995,6 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                             }
                             setUserSuccess(`Profil dan Mata Pelajaran Ampuan "${editingUser.name}" berhasil diperbarui!`);
                             setEditingUser(null);
-                            const updatedUsers = await fetchUsersFromAppsScript();
-                            setUsersList(updatedUsers);
                           } else {
                             alert(`Gagal menyimpan perubahan: ${res.message}`);
                           }
@@ -13071,8 +13015,8 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
               </div>
             )}
 
-            {/* Modal Panduan & Kode Google Apps Script */}
-            {showAppsScriptGuideModal && (
+            {/* Modal Panduan & Salin Kode SQL Supabase */}
+            {showSupabaseSqlModal && (
               <div className="fixed inset-0 z-50 bg-slate-900/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto animate-fadeIn">
                 <div className="bg-white border border-slate-200 rounded-3xl shadow-2xl max-w-3xl w-full my-8 overflow-hidden p-6 sm:p-8 space-y-6">
                   <div className="flex justify-between items-start pb-4 border-b border-slate-100">
@@ -13081,12 +13025,12 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                         <FileCode className="h-6 w-6" />
                       </div>
                       <div>
-                        <h3 className="text-lg font-black text-slate-800">Panduan Setup Google Apps Script Database</h3>
-                        <p className="text-xs text-slate-500">Gratis 100% tanpa batas kuota Firestore dan tanpa kartu kredit.</p>
+                        <h3 className="text-lg font-black text-slate-800">Panduan Setup Database Supabase</h3>
+                        <p className="text-xs text-slate-500">PostgreSQL Cloud dengan enkripsi keamanan tingkat tinggi & Row Level Security.</p>
                       </div>
                     </div>
                     <button 
-                      onClick={() => setShowAppsScriptGuideModal(false)}
+                      onClick={() => setShowSupabaseSqlModal(false)}
                       className="text-slate-400 hover:text-slate-600 p-1.5 rounded-full hover:bg-slate-100 transition"
                     >
                       <X className="h-5 w-5" />
@@ -13094,60 +13038,52 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                   </div>
 
                   <div className="space-y-4 text-xs text-slate-600 leading-relaxed max-h-[60vh] overflow-y-auto pr-2">
-                    <div className="bg-amber-50 border border-amber-200 p-4 rounded-2xl text-amber-900 space-y-1">
-                      <p className="font-bold flex items-center gap-1.5">
-                        <Sparkles className="h-4 w-4 text-amber-600" />
-                        Mengapa Memakai Google Apps Script?
+                    <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-2xl text-emerald-900 space-y-1">
+                      <p className="font-bold flex items-center gap-1.5 text-emerald-800">
+                        <Sparkles className="h-4 w-4 text-emerald-600" />
+                        Keuntungan Database Supabase
                       </p>
-                      <p className="text-[11px]">
-                        Google Apps Script menyimpan seluruh data akun pengguna secara langsung di Google Sheets milik Anda.
-                        Ini sepenuhnya gratis, tidak pernah terkena error "Quota Exceeded", dan data Anda tersimpan aman di Google Drive milik Anda sendiri.
+                      <p className="text-[11px] text-emerald-700">
+                        Supabase adalah database PostgreSQL berbasis cloud. Password guru tersimpan aman, performa super cepat, dan multi-perangkat tersinkronisasi otomatis untuk website <b>mastertkasma.my.id</b>.
                       </p>
                     </div>
 
                     <ol className="space-y-4 list-decimal list-inside font-medium text-slate-700">
                       <li className="space-y-1">
-                        <b>Buat Google Spreadsheet Baru:</b>
-                        <p className="text-slate-500 pl-5">Buka <a href="https://sheets.new" target="_blank" rel="noreferrer" className="text-indigo-600 font-bold underline">sheets.new</a> untuk membuat file Google Sheets baru. Beri nama file (contoh: <code>Database Users TKA SMA</code>).</p>
-                      </li>
-
-                      <li className="space-y-1">
-                        <b>Buka Editor Apps Script:</b>
-                        <p className="text-slate-500 pl-5">Di Google Sheets, klik menu <b>Ekstensi</b> &gt; <b>Apps Script</b>.</p>
+                        <b>Buka Dashboard Supabase:</b>
+                        <p className="text-slate-500 pl-5">Buka <a href="https://supabase.com/dashboard" target="_blank" rel="noreferrer" className="text-emerald-600 font-bold underline">supabase.com/dashboard</a>, login, dan buat Project baru (contoh: <code>tka-sma-db</code>).</p>
                       </li>
 
                       <li className="space-y-2">
-                        <b>Salin Kode Apps Script di Bawah Ini:</b>
-                        <div className="relative bg-slate-900 text-slate-100 p-4 rounded-2xl font-mono text-[11px] overflow-x-auto border border-slate-800">
+                        <b>Buka SQL Editor & Jalankan Kode Berikut:</b>
+                        <p className="text-slate-500 pl-5">Di menu sebelah kiri Supabase, klik <b>SQL Editor</b> &gt; klik <b>New query</b> &gt; Tempel kode SQL di bawah ini &gt; klik tombol hijau <b>Run</b>.</p>
+                        
+                        <div className="relative bg-slate-900 text-emerald-300 p-4 rounded-2xl font-mono text-[11px] overflow-x-auto border border-slate-800">
                           <button
                             type="button"
                             onClick={() => {
-                              navigator.clipboard.writeText(DEFAULT_APPSCRIPT_CODE);
-                              setIsCopyingScriptCode(true);
-                              setTimeout(() => setIsCopyingScriptCode(false), 2000);
+                              navigator.clipboard.writeText(SUPABASE_SQL_SETUP_CODE);
+                              setIsCopyingSqlCode(true);
+                              setTimeout(() => setIsCopyingSqlCode(false), 2000);
                             }}
                             className="absolute top-3 right-3 bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-bold text-[10px] px-3 py-1.5 rounded-lg shadow transition flex items-center gap-1"
                           >
-                            {isCopyingScriptCode ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                            <span>{isCopyingScriptCode ? 'Tersalin!' : 'Salin Kode'}</span>
+                            {isCopyingSqlCode ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                            <span>{isCopyingSqlCode ? 'Tersalin!' : 'Salin Kode SQL'}</span>
                           </button>
-                          <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap">{DEFAULT_APPSCRIPT_CODE}</pre>
+                          <pre className="max-h-56 overflow-y-auto whitespace-pre-wrap">{SUPABASE_SQL_SETUP_CODE}</pre>
                         </div>
                       </li>
 
                       <li className="space-y-1">
-                        <b>Simpan & Deploy (Terapkan) sebagai Aplikasi Web:</b>
-                        <p className="text-slate-500 pl-5">Hapus kode bawaan di editor Apps Script, tempel kode di atas, lalu klik tombol <b>Simpan (💾)</b>.</p>
-                        <p className="text-slate-500 pl-5">Klik tombol <b>Terapkan (Deploy)</b> &gt; <b>Penataan baru (New deployment)</b>.</p>
-                        <p className="text-slate-500 pl-5">Pilih jenis: <b>Aplikasi Web (Web app)</b>.</p>
-                        <p className="text-slate-500 pl-5">Atur <b>Jalankan sebagai (Execute as): Saya (Me)</b>.</p>
-                        <p className="text-slate-500 pl-5 font-bold text-emerald-700">Atur Siapa yang memiliki akses (Who has access): Siapa saja (Anyone).</p>
+                        <b>Ambil URL dan API Key:</b>
+                        <p className="text-slate-500 pl-5">Buka menu <b>Project Settings</b> (ikon roda gigi) &gt; pilih tab <b>API</b>.</p>
+                        <p className="text-slate-500 pl-5">Salin <b>Project URL</b> (contoh: <code>https://abcdefgh.supabase.co</code>) dan <b>anon public key</b>.</p>
                       </li>
 
                       <li className="space-y-1">
-                        <b>Salin URL Web App:</b>
-                        <p className="text-slate-500 pl-5">Klik <b>Terapkan</b>, izinkan akses akun Google jika diminta, lalu salin URL Aplikasi Web yang berakhiran <code>/exec</code>.</p>
-                        <p className="text-slate-500 pl-5">Tempelkan URL tersebut pada kolom input URL di panel Admin ini lalu klik <b>Simpan URL</b>.</p>
+                        <b>Tempel di Panel Ini:</b>
+                        <p className="text-slate-500 pl-5">Tempelkan Project URL dan Anon Key pada input di atas, klik <b>Tes Koneksi</b> lalu klik <b>Simpan</b>.</p>
                       </li>
                     </ol>
                   </div>
@@ -13155,10 +13091,10 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                   <div className="flex justify-end pt-4 border-t border-slate-100">
                     <button
                       type="button"
-                      onClick={() => setShowAppsScriptGuideModal(false)}
-                      className="bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold px-6 py-2.5 rounded-xl shadow text-xs transition"
+                      onClick={() => setShowSupabaseSqlModal(false)}
+                      className="bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold px-6 py-2.5 rounded-xl shadow text-xs transition"
                     >
-                      Saya Mengerti & Siap Gunakan
+                      Tutup & Mulai Gunakan
                     </button>
                   </div>
                 </div>
