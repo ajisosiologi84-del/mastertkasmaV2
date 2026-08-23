@@ -47,6 +47,7 @@ const INITIAL_DEFAULT_USERS: UserProfile[] = [
 
 /**
  * Initializes and synchronizes Google Apps Script configuration from Cloud Firestore
+ * Attaches real-time listener so any newly opened browser or domain receives the saved URL automatically.
  */
 export async function initAppsScriptConfig(): Promise<string> {
   try {
@@ -55,16 +56,46 @@ export async function initAppsScriptConfig(): Promise<string> {
       const data = snap.data();
       if (data.appsScriptUrl && typeof data.appsScriptUrl === 'string') {
         const url = data.appsScriptUrl.trim();
-        inMemoryAppsScriptUrl = url;
-        if (typeof window !== 'undefined') {
-          localStorage.setItem(APPSCRIPT_URL_KEY, url);
+        if (url) {
+          inMemoryAppsScriptUrl = url;
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(APPSCRIPT_URL_KEY, url);
+          }
+          return url;
         }
-        return url;
+      }
+    } else {
+      // If Firestore doesn't have it yet, check if current browser has it in localStorage to backfill
+      const local = typeof window !== 'undefined' ? localStorage.getItem(APPSCRIPT_URL_KEY) : null;
+      if (local && local.trim()) {
+        setDoc(doc(db, 'app_settings', 'global_config'), {
+          appsScriptUrl: local.trim(),
+          updatedAt: new Date().toISOString()
+        }, { merge: true }).catch(() => {});
       }
     }
   } catch (e) {
     console.warn("Notice reading Apps Script config from Firestore:", e);
   }
+
+  // Real-time listener for any instant changes
+  if (typeof window !== 'undefined') {
+    try {
+      onSnapshot(doc(db, 'app_settings', 'global_config'), (snapshot) => {
+        if (snapshot.exists()) {
+          const data = snapshot.data();
+          if (data.appsScriptUrl && typeof data.appsScriptUrl === 'string') {
+            const url = data.appsScriptUrl.trim();
+            if (url && url !== inMemoryAppsScriptUrl) {
+              inMemoryAppsScriptUrl = url;
+              localStorage.setItem(APPSCRIPT_URL_KEY, url);
+            }
+          }
+        }
+      }, (err) => console.warn("Notice subscribing to Apps Script config:", err));
+    } catch (e) {}
+  }
+
   return getAppsScriptUrl();
 }
 
