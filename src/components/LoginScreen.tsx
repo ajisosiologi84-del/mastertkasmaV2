@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { loginUser } from '../lib/userManagement';
+import { syncGlobalSupabaseConfig } from '../lib/supabase';
 import { 
   Lock, 
-  Mail, 
+  User, 
   Sparkles, 
   AlertCircle, 
   ArrowRight,
@@ -18,7 +19,7 @@ interface LoginScreenProps {
 }
 
 export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
-  const [email, setEmail] = useState('');
+  const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   
@@ -26,21 +27,26 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
   const [error, setError] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
+  // Sync Supabase config from Cloud on load so all devices & browsers have connection
+  useEffect(() => {
+    syncGlobalSupabaseConfig().catch(() => {});
+  }, []);
+
   const handleSignIn = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!email || !password) {
-      setError("Silakan isi semua bidang input.");
+    if (!identifier.trim() || !password.trim()) {
+      setError("Silakan masukkan Email / Username dan Password.");
       return;
     }
     setLoading(true);
     setError(null);
 
     try {
-      const res = await loginUser(email, password);
+      const res = await loginUser(identifier.trim(), password.trim());
       if (res.success && res.user) {
         onLoginSuccess(res.user.role, res.user.name, res.user);
       } else {
-        setError(res.message || "Email atau Password yang Anda masukkan salah.");
+        setError(res.message || "Email/Username atau Password yang Anda masukkan salah.");
       }
     } catch (err: any) {
       console.warn("Login attempt error:", err);
@@ -140,20 +146,25 @@ export default function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
         {/* Form Inputs (Sign In only) */}
         <form onSubmit={handleSignIn} className="space-y-4">
           <div>
-            <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">Alamat Email</label>
+            <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
+              Email / Nama Pengguna / Username
+            </label>
             <div className="relative">
               <span className="absolute inset-y-0 left-0 pl-3.5 flex items-center text-slate-500">
-                <Mail className="h-4 w-4" />
+                <User className="h-4 w-4" />
               </span>
               <input
-                type="email"
-                placeholder="nama@sekolah.sch.id"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
+                type="text"
+                placeholder="nama@sekolah.sch.id atau Nama Guru"
+                value={identifier}
+                onChange={(e) => setIdentifier(e.target.value)}
                 className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-10 pr-4 py-2.5 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500 transition"
                 disabled={loading}
               />
             </div>
+            <p className="text-[10px] text-slate-500 mt-1">
+              *Bisa masuk menggunakan <b>Email</b> atau <b>Nama Lengkap</b> yang terdaftar.
+            </p>
           </div>
 
           <div>

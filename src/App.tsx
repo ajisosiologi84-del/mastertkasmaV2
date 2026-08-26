@@ -12457,11 +12457,11 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                   <button
                     type="button"
                     onClick={async () => {
-                      saveStoredSupabaseConfig(supabaseUrlInput.trim(), supabaseKeyInput.trim());
+                      await saveStoredSupabaseConfig(supabaseUrlInput.trim(), supabaseKeyInput.trim());
                       setSupabaseTestMsg({
                         success: true,
                         text: supabaseUrlInput.trim() && supabaseKeyInput.trim()
-                          ? "Kredensial Supabase berhasil disimpan! Memuat data pengguna dari Supabase..."
+                          ? "Kredensial Supabase berhasil disimpan dan disinkronkan ke semua perangkat! Memuat data pengguna dari Supabase..."
                           : "Kredensial Supabase dikosongkan. Sistem menggunakan Cloud Database bawaan."
                       });
                       const users = await fetchUsersFromCloud();
@@ -12821,10 +12821,11 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                                   name: usr.name || '',
                                   email: usr.email || '',
                                   role: usr.role || 'user',
-                                  mataPelajaran: usr.mataPelajaran || 'Sosiologi'
+                                  mataPelajaran: usr.mataPelajaran || 'Sosiologi',
+                                  newPassword: ''
                                 })}
                                 className="p-1.5 rounded-lg border bg-indigo-50 hover:bg-indigo-100 text-indigo-600 border-indigo-200 hover:border-indigo-300 transition"
-                                title="Ubah Nama, Peran & Mapel Ampuan"
+                                title="Ubah Nama, Password, Peran & Mapel Ampuan"
                               >
                                 <Edit className="h-3.5 w-3.5" />
                               </button>
@@ -12894,16 +12895,45 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                     <div>
                       <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Email Pengguna (Readonly)</label>
                       <input type="text" disabled value={editingUser.email} className="w-full bg-slate-100 border border-slate-200 rounded-xl px-4 py-2.5 text-slate-500 font-medium cursor-not-allowed" />
+                      <p className="text-[10px] text-slate-400 mt-1">Email adalah identitas unik login dan akun sistem.</p>
                     </div>
 
                     <div>
-                      <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Nama Lengkap Guru</label>
+                      <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">Nama Lengkap / Username</label>
                       <input 
                         type="text" 
                         value={editingUser.name} 
                         onChange={(e) => setEditingUser({ ...editingUser, name: e.target.value })}
+                        placeholder="Contoh: Budi Santoso, S.Pd. atau budisosiologi"
                         className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl px-4 py-2.5 text-slate-800 font-bold text-xs"
                       />
+                      <p className="text-[10px] text-slate-400 mt-1">Guru juga dapat menggunakan Nama ini saat login di layar masuk.</p>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 mb-1">
+                        Password Baru <span className="text-slate-400 font-normal">(Kosongkan jika tidak ingin mengubah password)</span>
+                      </label>
+                      <div className="relative">
+                        <input 
+                          type={editingUser.showPassword ? "text" : "password"} 
+                          value={editingUser.newPassword || ''} 
+                          onChange={(e) => setEditingUser({ ...editingUser, newPassword: e.target.value })}
+                          placeholder="Masukkan password baru (minimal 6 karakter)"
+                          className="w-full bg-slate-50 border border-slate-200 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 rounded-xl pl-4 pr-10 py-2.5 text-slate-800 font-bold text-xs"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setEditingUser({ ...editingUser, showPassword: !editingUser.showPassword })}
+                          className="absolute inset-y-0 right-0 pr-3.5 flex items-center text-slate-400 hover:text-slate-600 transition cursor-pointer"
+                          title={editingUser.showPassword ? "Sembunyikan Password" : "Lihat Password"}
+                        >
+                          {editingUser.showPassword ? <EyeOff className="h-4 w-4 text-indigo-500" /> : <Eye className="h-4 w-4" />}
+                        </button>
+                      </div>
+                      <p className="text-[10px] text-slate-500 mt-1">
+                        🔑 Tulis password baru jika guru lupa password atau ingin mengganti kredensial.
+                      </p>
                     </div>
 
                     <div>
@@ -12976,16 +13006,31 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                       type="button"
                       disabled={isSavingUserEdit}
                       onClick={async () => {
+                        if (!editingUser.name || !editingUser.name.trim()) {
+                          alert('Nama pengguna tidak boleh kosong.');
+                          return;
+                        }
+                        if (editingUser.newPassword && editingUser.newPassword.trim().length > 0 && editingUser.newPassword.trim().length < 6) {
+                          alert('Password baru minimal harus 6 karakter.');
+                          return;
+                        }
+
                         setIsSavingUserEdit(true);
                         try {
                           const updatedSubject = editingUser.mataPelajaran || 'Sosiologi';
-                          const res = await updateUserInCloud({
+                          const updatePayload: any = {
                             id: editingUser.id,
                             email: editingUser.email,
-                            name: editingUser.name,
+                            name: editingUser.name.trim(),
                             role: editingUser.role,
                             mataPelajaran: updatedSubject
-                          });
+                          };
+
+                          if (editingUser.newPassword && editingUser.newPassword.trim().length >= 6) {
+                            updatePayload.password = editingUser.newPassword.trim();
+                          }
+
+                          const res = await updateUserInCloud(updatePayload);
 
                           if (res.success) {
                             if (editingUser.id === currentUser?.uid || editingUser.email === currentUser?.email) {
@@ -12993,7 +13038,8 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                               setUserRole(editingUser.role);
                               setConfig(prev => ({ ...prev, mataPelajaran: updatedSubject }));
                             }
-                            setUserSuccess(`Profil dan Mata Pelajaran Ampuan "${editingUser.name}" berhasil diperbarui!`);
+                            const passNote = editingUser.newPassword ? ' dan Password' : '';
+                            setUserSuccess(`Profil, Nama${passNote}, & Mata Pelajaran "${editingUser.name}" berhasil diperbarui!`);
                             setEditingUser(null);
                           } else {
                             alert(`Gagal menyimpan perubahan: ${res.message}`);
@@ -13005,7 +13051,7 @@ Draf Megaprompt Matriks Asesmen belum dibuat. Silakan buka menu "Matriks Asesmen
                           setIsSavingUserEdit(false);
                         }
                       }}
-                      className="px-5 py-2.5 text-xs font-extrabold bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl shadow transition flex items-center gap-1.5"
+                      className="px-5 py-2.5 text-xs font-extrabold bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl shadow transition flex items-center gap-1.5 cursor-pointer"
                     >
                       {isSavingUserEdit ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                       <span>Simpan Perubahan</span>

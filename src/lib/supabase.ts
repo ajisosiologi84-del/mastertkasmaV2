@@ -1,4 +1,6 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { db } from './firebase';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 
 // Default / fallback keys or from local storage / env vars
 let supabaseInstance: SupabaseClient | null = null;
@@ -43,7 +45,32 @@ export function getStoredSupabaseConfig(): { url: string; key: string } {
   return { url: url.trim(), key: key.trim() };
 }
 
-export function saveStoredSupabaseConfig(url: string, key: string): void {
+/**
+ * Initializes and syncs Supabase configuration from Cloud Firestore (for multi-browser access)
+ */
+export async function syncGlobalSupabaseConfig(): Promise<{ url: string; key: string }> {
+  try {
+    const docSnap = await getDoc(doc(db, 'system_config', 'supabase_config'));
+    if (docSnap.exists()) {
+      const data = docSnap.data();
+      if (data && data.url && data.key && isValidHttpUrl(data.url)) {
+        if (typeof window !== 'undefined') {
+          localStorage.setItem(SUPABASE_STORAGE_URL_KEY, data.url.trim());
+          localStorage.setItem(SUPABASE_STORAGE_ANON_KEY, data.key.trim());
+        }
+        currentSupabaseUrl = data.url.trim();
+        currentSupabaseKey = data.key.trim();
+        supabaseInstance = null; // Re-init client with fresh credentials
+        return { url: currentSupabaseUrl, key: currentSupabaseKey };
+      }
+    }
+  } catch (err) {
+    console.warn("Notice syncing global Supabase config from cloud:", err);
+  }
+  return getStoredSupabaseConfig();
+}
+
+export async function saveStoredSupabaseConfig(url: string, key: string): Promise<void> {
   currentSupabaseUrl = url.trim();
   currentSupabaseKey = key.trim();
 
@@ -59,6 +86,17 @@ export function saveStoredSupabaseConfig(url: string, key: string): void {
     } else {
       localStorage.removeItem(SUPABASE_STORAGE_ANON_KEY);
     }
+  }
+
+  // Persist to Cloud Firestore so all other browsers/devices receive it automatically
+  try {
+    await setDoc(doc(db, 'system_config', 'supabase_config'), {
+      url: currentSupabaseUrl,
+      key: currentSupabaseKey,
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch (err) {
+    console.warn("Notice saving global Supabase config to cloud:", err);
   }
 
   // Reset current client so it re-initializes on next call

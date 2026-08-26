@@ -14,6 +14,7 @@ import {
   getSupabaseClient, 
   getStoredSupabaseConfig, 
   saveStoredSupabaseConfig, 
+  syncGlobalSupabaseConfig,
   isValidHttpUrl,
   SUPABASE_SQL_SETUP_CODE 
 } from './supabase';
@@ -123,35 +124,87 @@ export async function seedDefaultUsersIfEmpty(): Promise<void> {
 }
 
 /**
+ * Normalizes string for flexible matching (removes excess spaces & lowers case)
+ */
+function normalizeIdentifier(str?: string): string {
+  if (!str) return '';
+  return str.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Checks if input identifier matches a user record (by Email, Username, or Full Name)
+ */
+function matchUserIdentifier(input: string, user: { email?: string; name?: string }): boolean {
+  const target = normalizeIdentifier(input);
+  if (!target) return false;
+
+  const email = normalizeIdentifier(user.email);
+  const name = normalizeIdentifier(user.name);
+  const emailPrefix = email.split('@')[0] || '';
+
+  // 1. Exact email match
+  if (email === target) return true;
+
+  // 2. Username / prefix before @ match
+  if (emailPrefix === target) return true;
+
+  // 3. Exact full name match
+  if (name === target) return true;
+
+  // 4. Partial name match if length > 2
+  if (name.length > 2 && (name.includes(target) || target.includes(name))) return true;
+
+  return false;
+}
+
+/**
+ * Verifies password match (supports default master fallback passwords)
+ */
+function verifyPasswordMatch(inputPass: string, storedPass?: string, email?: string): boolean {
+  const cleanPass = inputPass.trim();
+  const cleanStored = storedPass ? storedPass.trim() : '';
+  const cleanEmail = normalizeIdentifier(email);
+
+  if (!cleanStored) return true;
+  if (cleanStored === cleanPass) return true;
+
+  // Admin and Demo defaults fallback
+  if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) return true;
+  if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user')) return true;
+
+  return false;
+}
+
+/**
  * Real-time Subscription to Users (Supabase + Cloud Firestore fallback)
  * Instant synchronization across all browsers, mobile devices, and mastertkasma.my.id
  */
 export function subscribeToUsers(callback: (users: UserProfile[]) => void): () => void {
-  const supabase = getSupabaseClient();
+  // Sync global Supabase credentials first
+  syncGlobalSupabaseConfig().then(() => {
+    const supabase = getSupabaseClient();
+    if (supabase) {
+      fetchUsersFromCloud().then(users => {
+        if (users.length > 0) callback(users);
+      });
 
-  // If Supabase is active, listen to Supabase real-time changes
-  if (supabase) {
-    // Initial fetch from Supabase
-    fetchUsersFromCloud().then(users => {
-      if (users.length > 0) callback(users);
-    });
+      try {
+        const channel = supabase
+          .channel('users_realtime')
+          .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, async () => {
+            const freshUsers = await fetchUsersFromCloud();
+            callback(freshUsers);
+          })
+          .subscribe();
 
-    try {
-      const channel = supabase
-        .channel('users_realtime')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'users' }, async () => {
-          const freshUsers = await fetchUsersFromCloud();
-          callback(freshUsers);
-        })
-        .subscribe();
-
-      return () => {
-        supabase.removeChannel(channel);
-      };
-    } catch (e) {
-      console.warn("Notice Supabase channel subscription, fallback to Firestore/Interval:", e);
+        return () => {
+          supabase.removeChannel(channel);
+        };
+      } catch (e) {
+        console.warn("Notice Supabase channel subscription:", e);
+      }
     }
-  }
+  }).catch(() => {});
 
   // Fallback / standard: Cloud Firestore real-time listener
   try {
@@ -199,6 +252,7 @@ export function subscribeToUsers(callback: (users: UserProfile[]) => void): () =
  * Fetch all users from Supabase with Cloud Firestore & local cache fallback
  */
 export async function fetchUsersFromCloud(): Promise<UserProfile[]> {
+  await syncGlobalSupabaseConfig().catch(() => {});
   const supabase = getSupabaseClient();
 
   // 1. Try Supabase if configured
@@ -261,14 +315,21 @@ export async function fetchUsersFromCloud(): Promise<UserProfile[]> {
 }
 
 /**
- * Authenticates user credentials directly via Supabase, Cloud Firestore & Local Cache
+ * Authenticates user credentials directly via Supabase, Cloud Firestore & Local Cache.
+ * Supports flexible login via Email, Username, or Nama Lengkap.
  */
 export async function loginUser(
-  email: string, 
+  identifier: string, 
   pass: string
 ): Promise<{ success: boolean; user?: UserProfile; message?: string }> {
-  const cleanEmail = email.trim().toLowerCase();
+  const cleanInput = identifier.trim();
   const cleanPass = pass.trim();
+
+  if (!cleanInput || !cleanPass) {
+    return { success: false, message: 'Silakan masukkan Email / Username dan Password.' };
+  }
+
+  await syncGlobalSupabaseConfig().catch(() => {});
 
   // 1. Check Supabase first if configured
   const supabase = getSupabaseClient();
@@ -276,33 +337,31 @@ export async function loginUser(
     try {
       const { data, error } = await supabase
         .from('users')
-        .select('*')
-        .eq('email', cleanEmail)
-        .limit(1);
+        .select('*');
 
       if (!error && data && data.length > 0) {
-        const record = data[0];
-        const storedPass = record.password ? String(record.password).trim() : '';
-        const isPassMatch = 
-          !storedPass || 
-          storedPass === cleanPass ||
-          (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) ||
-          (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user'));
+        const matched = data.find(record => matchUserIdentifier(cleanInput, {
+          email: record.email,
+          name: record.name
+        }));
 
-        if (isPassMatch) {
-          const userObj: UserProfile = {
-            id: record.id || `usr_${cleanEmail}`,
-            email: record.email,
-            name: record.name || record.email.split('@')[0],
-            role: record.role === 'admin' ? 'admin' : 'user',
-            mataPelajaran: record.mata_pelajaran || record.mataPelajaran || 'Sosiologi'
-          };
-          return { success: true, user: userObj };
-        } else {
-          return { 
-            success: false, 
-            message: 'Password yang Anda masukkan salah. Silakan coba lagi.' 
-          };
+        if (matched) {
+          const isPassValid = verifyPasswordMatch(cleanPass, matched.password, matched.email);
+          if (isPassValid) {
+            const userObj: UserProfile = {
+              id: matched.id || `usr_${matched.email}`,
+              email: matched.email,
+              name: matched.name || matched.email.split('@')[0],
+              role: matched.role === 'admin' ? 'admin' : 'user',
+              mataPelajaran: matched.mata_pelajaran || matched.mataPelajaran || 'Sosiologi'
+            };
+            return { success: true, user: userObj };
+          } else {
+            return { 
+              success: false, 
+              message: 'Password yang Anda masukkan salah. Silakan periksa kembali.' 
+            };
+          }
         }
       }
     } catch (supaErr) {
@@ -314,26 +373,30 @@ export async function loginUser(
   try {
     const snap = await getDocs(collection(db, 'users'));
     if (!snap.empty) {
-      for (const d of snap.docs) {
-        const data = d.data();
-        if (data.email && String(data.email).trim().toLowerCase() === cleanEmail) {
-          const storedPass = data.password ? String(data.password).trim() : '';
-          const isPassMatch = 
-            !storedPass || 
-            storedPass === cleanPass ||
-            (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) ||
-            (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user'));
+      const firestoreUsers: any[] = [];
+      snap.forEach(d => firestoreUsers.push({ docId: d.id, ...d.data() }));
 
-          if (isPassMatch) {
-            const userObj: UserProfile = {
-              id: data.id || data.uid || d.id,
-              email: data.email,
-              name: data.name || data.email.split('@')[0],
-              role: data.role === 'admin' ? 'admin' : 'user',
-              mataPelajaran: data.mataPelajaran || 'Sosiologi'
-            };
-            return { success: true, user: userObj };
-          }
+      const matched = firestoreUsers.find(d => matchUserIdentifier(cleanInput, {
+        email: d.email,
+        name: d.name
+      }));
+
+      if (matched) {
+        const isPassValid = verifyPasswordMatch(cleanPass, matched.password, matched.email);
+        if (isPassValid) {
+          const userObj: UserProfile = {
+            id: matched.id || matched.uid || matched.docId,
+            email: matched.email,
+            name: matched.name || matched.email.split('@')[0],
+            role: matched.role === 'admin' ? 'admin' : 'user',
+            mataPelajaran: matched.mataPelajaran || 'Sosiologi'
+          };
+          return { success: true, user: userObj };
+        } else {
+          return { 
+            success: false, 
+            message: 'Password yang Anda masukkan salah. Silakan periksa kembali.' 
+          };
         }
       }
     }
@@ -343,23 +406,22 @@ export async function loginUser(
 
   // 3. Check local cached users
   const localUsers = getLocalCachedUsers();
-  const found = localUsers.find(u => {
-    const isEmailMatch = u.email.trim().toLowerCase() === cleanEmail;
-    if (!isEmailMatch) return false;
-    if (!u.password) return true;
-    const pwd = u.password.trim();
-    if (pwd === cleanPass) return true;
-    if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) return true;
-    if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user')) return true;
-    return false;
-  });
-
-  if (found) {
-    return { success: true, user: found };
+  const foundLocal = localUsers.find(u => matchUserIdentifier(cleanInput, u));
+  if (foundLocal) {
+    const isPassValid = verifyPasswordMatch(cleanPass, foundLocal.password, foundLocal.email);
+    if (isPassValid) {
+      return { success: true, user: foundLocal };
+    } else {
+      return { 
+        success: false, 
+        message: 'Password yang Anda masukkan salah. Silakan periksa kembali.' 
+      };
+    }
   }
 
-  // 4. Fallback for default master accounts
-  if (cleanEmail === 'admin@tka.com' && (cleanPass === 'admin123' || cleanPass === 'admin')) {
+  // 4. Master fallback for default system admin/user
+  const normalizedInput = normalizeIdentifier(cleanInput);
+  if ((normalizedInput === 'admin@tka.com' || normalizedInput === 'admin') && (cleanPass === 'admin123' || cleanPass === 'admin')) {
     const adminObj: UserProfile = {
       id: 'usr_admin',
       email: 'admin@tka.com',
@@ -368,7 +430,7 @@ export async function loginUser(
       mataPelajaran: 'Sosiologi'
     };
     return { success: true, user: adminObj };
-  } else if (cleanEmail === 'user@tka.com' && (cleanPass === 'user123' || cleanPass === 'user')) {
+  } else if ((normalizedInput === 'user@tka.com' || normalizedInput === 'user') && (cleanPass === 'user123' || cleanPass === 'user')) {
     const demoObj: UserProfile = {
       id: 'usr_demo',
       email: 'user@tka.com',
@@ -381,7 +443,7 @@ export async function loginUser(
 
   return { 
     success: false, 
-    message: 'Email atau Password salah. Silakan periksa kembali kredensial Anda.' 
+    message: 'Email atau Nama Pengguna tidak ditemukan. Silakan periksa kembali atau hubungi Administrator.' 
   };
 }
 
